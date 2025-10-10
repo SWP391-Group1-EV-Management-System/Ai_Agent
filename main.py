@@ -65,13 +65,6 @@ search_tool = Tool(
 # Tạo danh sách tools
 tools = [calculator_tool, list_users_tool, add_user_tool, search_tool]
 
-# Tạo system message với hướng dẫn sử dụng tools
-AGENT_SYSTEM_MESSAGE = SYSTEM_PROMPT + "\n\nCông cụ có sẵn:\n" + \
-    "- list_users: Xem danh sách người dùng\n" + \
-    "- add_user: Thêm người dùng mới\n" + \
-    "- Calculator: Tính toán\n" + \
-    "- search: Tìm kiếm thông tin"
-
 # --- Khởi tạo agent với tools ---
 agent = initialize_agent(
     tools,
@@ -81,15 +74,12 @@ agent = initialize_agent(
     memory=memory,
     handle_parsing_errors=True,
     max_iterations=3,
-    system_message=AGENT_SYSTEM_MESSAGE
+    #system_message=
 )
 
-# Đăng ký tools với agent
-agent.tools = tools
 
 # --- Chạy thử ---
-print("🤖 Gemini Agent sẵn sàng! Hãy nhập câu hỏi của bạn.")
-print("Ví dụ: 'Tính căn bậc hai của 2500 chia 5' hoặc 'Thủ đô của Nhật Bản là gì?'")
+print("🤖 Trợ lý ảo sẵn sàng! Hỗ trợ anh/chị.")
 print("Nhập 'exit' để thoát.\n")
 
 while True:
