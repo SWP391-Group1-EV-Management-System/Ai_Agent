@@ -1,0 +1,8 @@
+langchain
+langchain-google-genai
+langchain-community
+langgraph
+python-dotenv
+duckduckgo-search
+numexpr
+ddgs
