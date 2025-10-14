@@ -6,3 +6,12 @@ python-dotenv
 duckduckgo-search
 numexpr
 ddgs
+psycopg2-binary
+sqlalchemy
+asyncpg
+#pika
+fastapi
+uvicorn
+aio-pika 
+#aioredis
+redis
