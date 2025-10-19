@@ -5,14 +5,14 @@ from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from langchain.agents import create_react_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import LLMMathChain
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain.tools import Tool
 from tools.API_BE import listUser_api, add_user_to_api
 from data.personality_config import SYSTEM_PROMPT, PERSONALITY_CONFIG
 from data.training_examples import GREETING_EXAMPLES, SUPPORT_EXAMPLES, MATH_EXAMPLES
-from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.prebuilt import ToolNode, create_react_agent
+#from langgraph.graph import StateGraph, START, END, MessagesState
+#from langgraph.prebuilt import ToolNode, create_react_agent
+from langchain.agents import AgentExecutor
 #from langgraph.checkpoint.memory import MemorySaver
 from functools import partial
 from hashlib import md5
@@ -25,26 +25,32 @@ from contextlib import suppress
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
+from tools.register_tools import TOOLS
+from langchain_core.prompts import PromptTemplate
 
 load_dotenv()
-RABBIT_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:12345@localhost:5432/DataAIAgent")
-SHARD_COUNT = int(os.getenv("SHARD_COUNT", "8"))   # số queue shard
-AI_QUEUE_PREFIX = "ai_jobs.shard_"
-DLX = "ai_jobs.dlx"  # dead-letter exchange
-
+# --- Cấu hình chung ---
+RABBIT_URL = os.getenv("RABBITMQ_URL")
+REDIS_URL = os.getenv("REDIS_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
+SHARD_COUNT = int(os.getenv("SHARD_COUNT"))   # số queue shard
+AI_QUEUE_PREFIX = os.getenv("AI_QUEUE_PREFIX")
+DLX = os.getenv("DLX")  # dead-letter exchange
+#--------------------------------
 # async DB
 engine = create_async_engine(DATABASE_URL, pool_size=20, max_overflow=10)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 #executor = ThreadPoolExecutor(max_workers=5)
 app = FastAPI(title="AI Message Gateway")
 # LLM stub (replace with real client). If sync -> run_in_executor
+# ------------------------
+
+
 class DummyLLM:
     def predict(self, prompt: str):
         return f"LLM reply to: {prompt[:120]}"
 USE_DUMMY = os.getenv("USE_DUMMY", "false").lower() == "true"
-
+# sử dụng Gemini hoặc dummy tránh tốn token
 if USE_DUMMY:
     llm = DummyLLM()
 else:
@@ -55,16 +61,49 @@ else:
         max_tokens=2048,
         top_p=0.95,
     )
-llm_sem = asyncio.Semaphore(int(os.getenv("LLM_CONCURRENCY", "4")))
+#---------------------------------------------
+
+llm_sem = asyncio.Semaphore(int(os.getenv("LLM_CONCURRENCY")))
+
+def pre_model_hook(messages, state, **kwargs):
+    """
+    messages: list các Messages (HumanMessage/AIMessage/SystemMessage) trước khi gửi model
+    state: state dict của agent (LangGraph)
+    Mục đích: thêm system prompt vào đầu, attach metadata (ví dụ list tool names).
+    """
+    # Thêm system prompt cố định (đừng thêm trùng lặp nếu đã tồn tại)
+    if not any(m.type == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": system_prompt})
+
+    # Bạn có thể insert 1 system message mô tả tools hiện có (giúp model biết tên/schema)
+    tool_names = ", ".join([t.name for t in MY_TOOLS])
+    messages.insert(1, {"role": "system", "content": f"Available tools: {tool_names}"})
+
+    return messages
+# Tạo ReAct agent (dạng async)
+agent_executor = create_react_agent(
+    model=llm,              # hoặc "google:gemini-2.5-flash" nếu create_react_agent hỗ trợ string
+    tools=TOOLS,
+    pre_model_hook=pre_model_hook,
+    #checkpointer=checkpointer,
+    max_iterations=10,      # giới hạn vòng suy nghĩ → tránh loop vô hạn
+    messages_modifier=None, # nếu cần custom further
+) # xử lý logic suy luận, tạo prompt, chọn tool cần dùng
+
+# Bọc thành executor có quản lý
+#agent = AgentExecutor(agent=agent_core, tools=TOOLS, verbose=True,handle_parsing_errors=True) # nhận input, chạy vòng lặp “suy nghĩ → hành động → quan sát”, và gọi LLM thật + tool thật
+# 👉 Gắn biến SYSTEM_PROMPT cố định (hoặc động)
 # --- Thiết lập logger toàn cục ---
 # ✅ Tạo LCEL Chain với history support
+'''
 chat_prompt = ChatPromptTemplate.from_messages([
     ("system", "Bạn là trợ lý AI thông minh và thân thiện. Hãy trả lời câu hỏi của người dùng một cách chính xác và hữu ích."),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{user_input}")
 ])
+'''
 # ✅ Chain: prompt | llm | parser
-chat_chain = chat_prompt | llm | StrOutputParser()
+#chat_chain = chat_prompt | llm | StrOutputParser()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
@@ -76,6 +115,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+'''
 async def call_llm_with_history(user_input: str, history: List[Dict[str, str]]) -> str:
     """
     Gọi LLM với chat history sử dụng LCEL Chain
@@ -102,15 +142,50 @@ async def call_llm_with_history(user_input: str, history: List[Dict[str, str]]) 
                 chat_history.append(AIMessage(content=msg["content"]))
         
         # ✅ Invoke chain với ainvoke() - async native
-        response = await chat_chain.ainvoke({
-            "chat_history": chat_history,
-            "user_input": user_input
+        response = await agent.ainvoke({
+        "input": user_input,
+        "chat_history": chat_history
+        #"messages": chat_history + [HumanMessage(content=user_input)]
         })
         
-        return response
+        return response["output"] if isinstance(response, dict) else response
     
     except Exception as e:
         logger.error(f"❌ LLM call failed: {e}", exc_info=True)
+        return "Xin lỗi, tôi không thể xử lý yêu cầu này lúc này."
+'''
+async def call_llm_with_history(user_input: str, history: List[Dict[str,str]]) -> str:
+    try:
+        # convert history -> LangGraph expects "messages" input
+        messages = []
+        for msg in history[-10:]:
+            if msg["role"] == "user":
+                messages.append({"role":"user","content": msg["content"]})
+            else:
+                messages.append({"role":"assistant","content": msg["content"]})
+
+        # append current user message (LangGraph example uses "messages": [..])
+        messages.append({"role":"user","content": user_input})
+
+        # **Async invoke**: agent_executor supports .ainvoke(...)
+        result = await agent_executor.ainvoke({"messages": messages, "config": {"thread_id": user_id}})
+        # "result" sẽ chứa hoàn state; đầu ra final text thường ở result["output"] hoặc result["messages"]
+        # Kiểm tra cấu trúc trả về (nên log) — example:
+        if isinstance(result, dict):
+            # Một cách an toàn lấy final answer
+            if "output" in result:
+                return result["output"]
+            # fallback: inspect messages
+            msgs = result.get("messages") or []
+            # lấy message assistant cuối cùng
+            for m in reversed(msgs):
+                if m.get("role") in ("assistant", "ai"):
+                    return m.get("content", "")
+            return str(result)
+        return str(result)
+
+    except Exception as e:
+        logger.error("LLM call failed (LangGraph): %s", e, exc_info=True)
         return "Xin lỗi, tôi không thể xử lý yêu cầu này lúc này."
 # util: shard key -> queue name
 def user_shard_queue(user_id: str) -> str:
@@ -345,6 +420,7 @@ async def start_consumer():
     logger.info("✅ Worker shutdown hoàn tất.")
 
 # FastAPI app cho UI gửi message
+#http://localhost:8000/send_message
 @app.post("/send_message")
 async def send_message(request: Request):
     """Nhận message từ UI và gửi vào RabbitMQ shard queue"""
