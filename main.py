@@ -9,6 +9,7 @@ Version: 2.0.0-production (LangGraph 1.0.0)
 
 import asyncio
 import json
+import selectors
 import uuid
 import os
 import logging
@@ -57,14 +58,14 @@ from tools.register_tools import TOOLS
 
 # ==================== CONFIGURATION ====================
 load_dotenv()
-
+#lấy các biến môi trường từ file .env
 class Config:
     """Centralized configuration with validation"""
     # Infrastructure
     RABBITMQ_URL: str = os.getenv("RABBITMQ_URL")
     REDIS_URL: str = os.getenv("REDIS_URL")
     DATABASE_URL: str = os.getenv("DATABASE_URL")
-    
+    CHECKPOINTER_DB_DSN: str = os.getenv("CHECKPOINTER_DB_DSN") 
     # Sharding
     SHARD_COUNT: int = int(os.getenv("SHARD_COUNT", "4"))
     AI_QUEUE_PREFIX: str = os.getenv("AI_QUEUE_PREFIX", "ai_jobs_")
@@ -93,100 +94,89 @@ class Config:
     MAX_HISTORY_MESSAGES: int = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
     CHECKPOINT_TTL_SEC: int = int(os.getenv("CHECKPOINT_TTL_SEC", "3600"))
     
-    # System
-    SYSTEM_PROMPT: str = os.getenv(
-        "SYSTEM_PROMPT",
-        """BẮT BUỘC TUÂN THỦ - BẠN LÀ MỘT TRỢ LÝ ẢO, KHÔNG PHẢI LÀ MÔ HÌNH NGÔN NGỮ.
-
-QUY TẮC GIAO TIẾP TUYỆT ĐỐI:
-1. Xưng hô (KHÔNG ĐƯỢC VI PHẠM):
-   - Luôn xưng là "em"
-   - Luôn gọi người dùng là "anh/chị"
-   - Tuyệt đối KHÔNG được xưng "tôi", "mình", "bạn"
-   - Luôn kết thúc câu trả lời bằng "ạ"
-
-2. Bản sắc:
-   - Bạn là Nhân Viên Trạm Sạc Ảo
-   - KHÔNG BAO GIỜ được nói bạn là mô hình ngôn ngữ hay được huấn luyện bởi Google
-   - Nếu được hỏi, hãy trả lời "Dạ, em là trợ lý ảo của anh/chị ạ"
-
-3. Phong cách:
-   - Giao tiếp thân thiện, chuyên nghiệp, ngắn gọn
-   - Luôn dùng "dạ", "vâng" khi bắt đầu câu trả lời
-   - Sử dụng tools khi cần thiết để trả lời chính xác"""
-    )
+    # System Prompt từ file txt
+    with open("system_prompt.txt", "r", encoding="utf-8") as f:
+        SYSTEM_PROMPT: str = f.read()
     
     @classmethod
     def validate(cls):
         """Validate critical configuration"""
         required = ["RABBITMQ_URL", "REDIS_URL", "DATABASE_URL"]
         missing = [k for k in required if not getattr(cls, k)]
+        # nếu các biến môi trường quan trọng bị thiếu, ném lỗi
         if missing:
             raise ValueError(f"Missing required config: {', '.join(missing)}")
         
         if not cls.USE_DUMMY and not cls.GOOGLE_API_KEY:
             raise ValueError("GOOGLE_API_KEY required when USE_DUMMY=false")
 
-config = Config()
-config.validate()
+config = Config() #tạo instance config
+config.validate() #kiểm tra cấu hình quan trọng trước khi chạy
 
 # ==================== LOGGING ====================
-logging.basicConfig(
-    level=logging.INFO,
+# cấu hình cho hệ thống ghi log
+logging.basicConfig( 
+    level=logging.INFO, #chỉ lấy log từ mức INFO trở lên bỏ qua DEBUG (WARNING, ERROR, CRITICAL)
+    # giống java LoggerFactory 
     format="%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    #asctime là thời gian | levelname là mức độ log (INFO, ...) | name là tên logger | lineno là số dòng trong code | message là nội dung log
+    datefmt="%Y-%m-%d %H:%M:%S", #định dạng lại thời gian
+    # 2025-10-23 17:33:05 ví dụ 
     handlers=[
-        logging.FileHandler("ai_worker.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
+        logging.FileHandler("ai_worker.log", encoding="utf-8"), #ghi vào file
+        logging.StreamHandler(sys.stdout) #ghi ra console
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__) #khởi tạo logger trong file hiện tại 
 
 # ==================== DATABASE ====================
-engine = create_async_engine(
-    config.DATABASE_URL,
-    pool_size=config.DB_POOL_SIZE,
-    max_overflow=config.DB_MAX_OVERFLOW,
-    pool_pre_ping=True,
-    echo=False
+engine = create_async_engine( # sử dụng kết nối bất đồng bộ ( không gây chặn chương trình khi đang truy xuất)
+    config.DATABASE_URL, # link kết nối db
+    pool_size=config.DB_POOL_SIZE, #số kết nối tối đa trong pool 
+    # (giống như cổng điện thoại công cộng, người này sử dụng trã lại đến người khác sử dụng, có 20 cái đt)
+    max_overflow=config.DB_MAX_OVERFLOW, #phòng trường hợp quá tải
+    # (nếu 20 cái đt đều bận, có thể tạm thời mượn thêm 10 cái nữa để phục vụ khách hàng)
+    pool_pre_ping=True, #kiểm tra kết nối còn sống trước khi sử dụng
+    echo=False #không in câu lệnh SQL ra log ( thừa), đổi true nếu muốn xem chi tiết để debug
 )
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False
+AsyncSessionLocal = async_sessionmaker( #EntityManagerFactory trong java
+    # tạo session giao tiếp bất đồng bộ với db
+    engine, # cấu hình ở trên 
+    class_=AsyncSession, #bất đồng bộ
+    expire_on_commit=False # tránh xóa dữ liệu trong session, để truy xuất lại nhanh hơn
 )
 
 # ==================== LLM ====================
-class DummyLLM:
-    """Dummy LLM for testing without token costs"""
+class DummyLLM: 
+    """Dummy LLM dùng để test để không tốn token"""
     async def ainvoke(self, messages):
-        await asyncio.sleep(1)
-        last_msg = messages[-1]
-        content = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
-        return AIMessage(content=f"[DUMMY] Response to: {content[:100]}...")
+        await asyncio.sleep(1) # tăng độ trễ
+        last_msg = messages[-1] #lấy tin nhắn cuối cùng vì trong đối tượng messages sẽ có nhiều fiedls khác nhau, fiedl cuối cùng là humanMessage 
+        content = last_msg.content if hasattr(last_msg, 'content') else str(last_msg) # in nội dung tin nhắn tức phần content, nếu không thì in hêt ra tránh lỗi
+        return AIMessage(content=f"[DUMMY] Response to: {content[:100]}...") # trả về tin nhắn AIMessage với nội dung giả lập
     
-    def bind_tools(self, tools):
+    def bind_tools(self, tools): # không gắn tools cho dummy 
         return self
 
-# Initialize LLM
+# Xác thực gọi dummy hoặc Google Gemini
 if config.USE_DUMMY:
     llm = DummyLLM()
     logger.info("🧪 Using DUMMY LLM (no API calls)")
 else:
     llm = ChatGoogleGenerativeAI(
-        model=config.LLM_MODEL,
-        temperature=config.LLM_TEMPERATURE,
-        google_api_key=config.GOOGLE_API_KEY,
-        max_tokens=config.LLM_MAX_TOKENS,
-        top_p=0.95,
+        model=config.LLM_MODEL, #gọi model gemini cụ thể 
+        temperature=config.LLM_TEMPERATURE, # độ sáng tạo của câu trã lời (để ở mức an toàn tránh bịa chuyện)
+        google_api_key=config.GOOGLE_API_KEY, #API key
+        max_tokens=config.LLM_MAX_TOKENS, # giới hạn số token trong câu trả lời
+        top_p=0.95, #độ rộng của phân phối xác suất (giúp đa dạng câu trả lời)
     )
     logger.info(f"🤖 Using Google Gemini: {config.LLM_MODEL}")
 
-# Bind tools to LLM
+# gắn tools cho LLM gemini
 llm_with_tools = llm.bind_tools(TOOLS) if not config.USE_DUMMY else llm
-
+#TOOLS đã được gắn sẵn và import 
 # Semaphore for LLM concurrency control
-llm_sem = asyncio.Semaphore(config.LLM_CONCURRENCY)
+llm_sem = asyncio.Semaphore(config.LLM_CONCURRENCY) # cho phép số lượng LLM đồng thời một lúc chạy là LLM_CONCURRENCY
 
 # ==================== AGENT STATE (LANGGRAPH 1.0.0) ====================
 from operator import add
@@ -198,21 +188,22 @@ class AgentState(TypedDict):
     thread_id: str
 
 # ==================== AGENT NODES ====================
-async def call_model(state: AgentState):
-    """Call the LLM with tools"""
-    messages = state["messages"]
+async def call_model(state: AgentState): #state ở đây là dict giống như Map trong java
+    """Trái tim của agent - gọi LLM với messages đã có"""
+    messages = state["messages"] #lấy value của key messages trong state, tức là các tin nhắn mới được gửi đến agent
     
-    # ✅ ALWAYS inject system prompt at the beginning
+    # gán system prompt vào systemMessages (SystemMessage, HumanMessage, AIMessage)
     system_msg = SystemMessage(content=config.SYSTEM_PROMPT)
     
     # Remove any existing system messages to avoid duplicates
-    messages_without_system = [m for m in messages if not isinstance(m, SystemMessage)]
+    messages_without_system = [m for m in messages if not isinstance(m, SystemMessage)] 
+    # xóa systemMessage cũ nếu có, m sẽ lưu những phần còn lại mà không phải systemMessage
     
     # ✅ Filter out empty messages that could cause Gemini errors
-    valid_messages = []
+    valid_messages = [] # danh sách lưu trữ các message hợp lệ ( lọc các message rỗng, tránh lỗi cho gemini)
     for m in messages_without_system:
         if hasattr(m, 'content') and m.content:
-            valid_messages.append(m)
+            valid_messages.append(m) #(hasattr(m, 'content') hàm kiểm tra m có thuộc tính content không, và m.content kiểm tra content có rỗng không)
         elif hasattr(m, 'tool_calls') and m.tool_calls:
             valid_messages.append(m)
         else:
@@ -221,32 +212,32 @@ async def call_model(state: AgentState):
     # Add system prompt at the start
     messages_with_system = [system_msg] + valid_messages
     
-    # ✅ Ensure we have at least 2 messages (system + user)
+    # bắt lỗi nếu chỉ có mỗi systemMessage mà không có message nào khác 
     if len(messages_with_system) < 2:
-        logger.error(f"❌ Not enough messages to send to LLM: {len(messages_with_system)}")
+        logger.error(f"❌ Not enough messages to send to LLM: {len(messages_with_system)}") # số phần tử trong messages_with_system
         return {"messages": [AIMessage(content="Xin lỗi anh/chị, em gặp lỗi khi xử lý yêu cầu ạ.")]}
     
-    # Log for debugging
+    # Log
     logger.debug(f"🔍 Sending {len(messages_with_system)} messages to LLM")
     
     # Invoke LLM with tools
     try:
-        async with llm_sem:
-            response = await llm_with_tools.ainvoke(messages_with_system)
-        return {"messages": [response]}
+        async with llm_sem: #còn chỗ trống trong semaphore thì mới gọi LLM
+            response = await llm_with_tools.ainvoke(messages_with_system) # gửi tất cả message đã có (bao gồm systemMessage và userMessage) đến LLM để lấy câu trả lời
+        return {"messages": [response]} 
     except Exception as e:
         logger.error(f"❌ LLM invocation error: {e}")
         return {"messages": [AIMessage(content="Xin lỗi anh/chị, em gặp lỗi khi xử lý yêu cầu ạ.")]}
 
 def should_continue(state: AgentState):
-    """Determine if we should continue to tools or end"""
-    messages = state["messages"]
-    last_message = messages[-1]
+    """Kiểm tra xem agent có cần gọi tools hay dừng lại"""
+    messages = state["messages"] # lấy tin nhắn 
+    last_message = messages[-1] # lấy tin nhắn cuối cùng mà AI vừa tạo ra 
     
-    # If there are tool calls, continue to tools
+    # kiểm tra xem nó có muốn gọi tools hay không, không thì cho nó end 
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tools"
-    # Otherwise end
+    # end state ở đây
     return END
 
 # ==================== LANGGRAPH AGENT (1.0.0) ====================
@@ -255,13 +246,13 @@ async def create_agent_executor():
     Create LangGraph agent with PostgreSQL checkpointer
     Updated for LangGraph 1.0.0
     """
-    # PostgreSQL checkpointer (optional)
+    # PostgreSQL checkpointer
     checkpointer = None
-    if POSTGRES_AVAILABLE and config.DATABASE_URL:
+    if POSTGRES_AVAILABLE and config.DATABASE_URL: #khởi tạo checkpointer tăng tính bền vững
         try:
-            checkpointer_cm = AsyncPostgresSaver.from_conn_string(config.DATABASE_URL)
-            checkpointer = await checkpointer_cm.__aenter__()
-            await checkpointer.setup()
+            checkpointer_cm = AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) # tạo context manager cho checkpointer
+            checkpointer = await checkpointer_cm.__aenter__() # khởi tạo checkpointer bất đồng bộ ( lúc này context manager đã vào trạng thái active) # __aenter__() là hàm để chuẩn bị tài nguyên, khởi động để sử dụng 
+            await checkpointer.setup() # sẵn sàng sử dụng 
             logger.info("✅ PostgreSQL checkpointer enabled")
         except Exception as e:
             logger.warning(f"⚠️  Failed to setup PostgreSQL checkpointer: {e}")
@@ -270,24 +261,27 @@ async def create_agent_executor():
     else:
         logger.info("📝 Running without checkpointer (no persistence)")
     
-    # ✅ Create tool node
-    tool_node = ToolNode(TOOLS)
+    # Tạo tool node 
+    tool_node = ToolNode(TOOLS) 
     
     # ✅ CRITICAL FIX: Wrap tool node to maintain conversation flow
-    async def fixed_tool_node(state: AgentState):
+    async def tool_node_func(state: AgentState):
         print("\n" + "=" * 80)
         print("🔧 TOOL NODE CALLED")
-        original_messages = state['messages']
+        original_messages = state['messages'] # lấy toàn bộ messages hiện tại trước khi gọi tool
         print(f"📊 Messages before tools: {len(original_messages)}")
         
-        # Debug: Show what we have
+        # Debug: liệt kê tin nhắn đang có trước khi gọi tool
         for i, msg in enumerate(original_messages):
             msg_type = type(msg).__name__
             print(f"  [{i}] {msg_type}")
+            ''' [0] SystemMessage
+                [1] HumanMessage
+                [2] AIMessage'''
         
         try:
-            # Execute tools
-            result = await tool_node.ainvoke(state)
+            # gọi tools ( ở bước này LLM đã phân tích và đưa ra tools cần và tham số phục vụ cho tools rồi)
+            result = await tool_node.ainvoke(state) # ainvoke này là hàm của thu viện langgraph
             tool_messages = result.get('messages', [])
             
             print(f"✅ Tool execution completed")
@@ -295,18 +289,16 @@ async def create_agent_executor():
             
             # Debug tool results
             for msg in tool_messages:
-                msg_type = type(msg).__name__
-                content_preview = str(msg.content)[:100] if hasattr(msg, 'content') else str(msg)[:100]
+                msg_type = type(msg).__name__ # in ra kiểu message "__name__" trã về tên lớp dạng string
+                content_preview = str(msg.content)[:100] if hasattr(msg, 'content') else str(msg)[:100] # in ra nội dung của toolMessage nếu có hoặc cả msg, content là phần tin nhắn chính
                 print(f"   → {msg_type}: {content_preview}...")
             
-            # ✅ CRITICAL: LangGraph state reducer should APPEND, not REPLACE
-            # But we return only new messages and let LangGraph merge
-            # The issue is that we need to ensure proper message order
             
             print(f"🔗 Returning {len(tool_messages)} tool messages (LangGraph will merge)")
             print("=" * 80 + "\n")
             
-            # ✅ Return ONLY new messages - LangGraph's MessagesState will handle merging
+            # # mô hình chạy bất đồng bộ này sẽ làm nhiều node (worker) chạy song song để xứ lý vấn đề
+            # do đó node này cần trã đúng kết quả về cho node chính (agent) để nó tổng hợp, để tránh bị ghi đè chỉ gửi phần content toolMessage
             return {"messages": tool_messages}
             
         except Exception as e:
@@ -320,72 +312,79 @@ async def create_agent_executor():
     
     # ✅ CRITICAL FIX: Define state with proper reducer
     class FixedAgentState(TypedDict):
-        """Agent state with message list reducer"""
-        messages: Annotated[List[BaseMessage], add]  # ✅ Use 'add' to APPEND messages
+        """ Agent state với reducer để nối messages đúng cách """
+        messages: Annotated[List[BaseMessage], add]  # Use 'add' to APPEND messages
         user_id: str
         thread_id: str
     
-    workflow = StateGraph(FixedAgentState)
-    
+    workflow = StateGraph(FixedAgentState) # khai báo workflow với state đã fix
+    #StateGraph đảm bảo luồng công việc của agent được quản lý đúng cách
     # Add nodes
-    workflow.add_node("agent", call_model)
-    workflow.add_node("tools", fixed_tool_node)
+    workflow.add_node("agent", call_model) #node này gọi LLM trã về câu trả lời và toolCalls nếu có
+    workflow.add_node("tools", tool_node_func) #node này gọi tools nếu LLM yêu cầu
     
-    # Add edges
-    workflow.add_edge(START, "agent")
+    # bắt đầu luồng công việc
+    workflow.add_edge(START, "agent") 
+    # kiểm tra có toolMessage không để quyết định chạy tiếp hay dừng
     workflow.add_conditional_edges(
         "agent",
-        should_continue,
+        should_continue, # check có toolMessage không
         {
             "tools": "tools",
-            END: END
+            END: END # trã end thì dừng vì lúc này agent đã xong việc
         }
     )
-    workflow.add_edge("tools", "agent")
+    workflow.add_edge("tools", "agent") # có thể gọi tools tiếp và add_conditional_edges lại chạy để quyết định
+    # nếu cần tools thì cần đi tiếp đến agent để LLM trã kết quả theo ngôn ngữ con người 
     
     # Compile
     if checkpointer:
-        app = workflow.compile(checkpointer=checkpointer)
+        app = workflow.compile(checkpointer=checkpointer) # thực hiện gói workflow thành executor (app)
         logger.info(f"✅ Agent created with {len(TOOLS)} tools + PostgreSQL persistence")
     else:
         app = workflow.compile()
         logger.info(f"✅ Agent created with {len(TOOLS)} tools (no persistence)")
-    
-    return app, checkpointer
+    #app là executor để gọi agent và nó được python gói lại thành một Object
+    return app, checkpointer 
 
-# Global agent instance
+# Tạo Global instance
 agent_executor = None
 checkpointer = None
+# được gán ở start_consumer()
 
 # ==================== UTILITIES ====================
 def user_shard_queue(user_id: str) -> str:
-    """Consistent hash to determine queue shard"""
-    h = int(md5(user_id.encode()).hexdigest()[:8], 16)
+    """Hàm phân tán người dùng vào một queue cố định"""
+    # giúp lưu lại context trên mỗi lần hội thoại liên tục, tránh query lại
+    h = int(md5(user_id.encode()).hexdigest()[:8], 16) # hash user_id lấy 8 ký tự đầu và chuyển thành số nguyên
     return f"{config.AI_QUEUE_PREFIX}{h % config.SHARD_COUNT}"
-
+    # nên cải tiến sử dụng distributed state store lưu cache lên redis (RAM) và Load Balancer để chọn worker ít tải nhất
+    # hiện tại chưa có cơ chế mỗi worker xử lý một queue cố định, mà các worker đang tranh nhau lấy message nếu rảnh  
 async def acquire_lock(redis: aioredis.Redis, key: str, ttl_ms: int = None) -> bool:
-    """Distributed lock using Redis SET NX"""
-    ttl = ttl_ms or config.LOCK_TTL_MS
-    return await redis.set(key, "1", nx=True, px=ttl)
-
+    """Lock request lại nếu đã có worker xử lý nó (redis distributed lock)"""
+    ttl = ttl_ms or config.LOCK_TTL_MS # khóa 30s cho worker xử lý (mặc định)
+    return await redis.set(key, "1", nx=True, px=ttl) #key là đặt tên cho khóa, và gán đại value cho nó là 1 
+#nx = NotExists: chỉ đặt khóa nếu nó chưa tồn tại , px thời gian 
+# trả về true nếu đặt khóa thành công, false nếu đã có có worker khác lấy rồi 
+# nếu hết thời gian redis tự xóa và chờ worker khác lấy 
 async def release_lock(redis: aioredis.Redis, key: str):
-    """Release distributed lock"""
+    """Xóa khóa sau khi xử lý xong"""
     await redis.delete(key)
-
+# aioredis là thư viện chạy redis bất đồng bộ
 async def is_job_completed(redis: aioredis.Redis, job_id: str) -> bool:
-    """Check if job already processed (idempotency)"""
+    """Tránh xử lý lặp lại công việc đã hoàn thành"""
     return await redis.sismember("jobs:completed", job_id)
 
 async def mark_job_completed(redis: aioredis.Redis, job_id: str, ttl: int = 86400):
-    """Mark job as completed for idempotency"""
-    await redis.sadd("jobs:completed", job_id)
-    await redis.expire("jobs:completed", ttl)
+    """Đánh dấu công việc đã hoàn thành để đảm bảo tính idempotency"""
+    await redis.sadd("jobs:completed", job_id) # thêm id job vào redis 
+    await redis.expire("jobs:completed", ttl) # đặt timeout 1 ngày 
 
 # ==================== DATABASE OPERATIONS ====================
-async def load_conversation_history(user_id: str, limit: int = None) -> List[Dict[str, str]]:
-    """Load conversation history from PostgreSQL"""
+async def load_conversation_history(user_id: str, limit: int = None) -> List[Dict[str, str]]: # giá trị trã về ( có hay không cũng đc vì python là ngôn ngữ dynamically typed)
+    """lấy lịch sử trò chuyện từ PostgreSQL ( có giới hạn số tin nhắn lấy)"""
     limit = limit or config.MAX_HISTORY_MESSAGES
-    async with AsyncSessionLocal() as session:
+    async with AsyncSessionLocal() as session: # tạo đối tượng session giao tiếp với db
         result = await session.execute(
             text("""
                 SELECT role, content, created_at 
@@ -395,15 +394,15 @@ async def load_conversation_history(user_id: str, limit: int = None) -> List[Dic
                 LIMIT :limit
             """),
             {"user_id": user_id, "limit": limit}
-        )
-        rows = result.fetchall()
+        ) # lấy DESC tin nhắn từ dưới lên trên rồi xuống kia mới reverse nó lại 
+        rows = result.fetchall() # lấy tất cả các dòng kết quả
         return [
-            {"role": row[0], "content": row[1], "created_at": str(row[2])}
-            for row in reversed(rows)
+            {"role": row[0], "content": row[1], "created_at": str(row[2])} #row[0] là lấy index cột 0 trong row đó 
+            for row in reversed(rows) # lặp qua từng row, đảo ngược thứ tự ( tức lặp dưới lên) để có tin nhắn từ cũ đến mới
         ]
 
 async def save_message(user_id: str, role: str, content: str):
-    """Save message to PostgreSQL"""
+    """Lưu tin nhắn vào PostgreSQL"""
     async with AsyncSessionLocal() as session:
         await session.execute(
             text("""
@@ -414,8 +413,8 @@ async def save_message(user_id: str, role: str, content: str):
                 "user_id": user_id,
                 "role": role,
                 "content": content,
-                "created_at": datetime.now()  # ✅ Fixed: Use datetime.now() instead of utcnow()
-            }
+                "created_at": datetime.now() 
+            } # đã dùng place holder để tránh SQL injection (:user_id, :role, ...)
         )
         await session.commit()
 
@@ -426,10 +425,10 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
     Updated for LangGraph 1.0.0
     """
     try:
-        # Load conversation history
+        # Tải lịch sử chat
         history = await load_conversation_history(user_id)
         
-        # Convert to LangChain messages
+        # chuyển sang định dạng mà agent hiểu được
         messages = []
         for msg in history:
             if msg["role"] == "user":
@@ -437,10 +436,10 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
             elif msg["role"] == "assistant":
                 messages.append(AIMessage(content=msg["content"]))
         
-        # Add current message
+        # thêm câu input của người dùng vào luôn 
         messages.append(HumanMessage(content=user_input))
         
-        # Thread ID for checkpointing
+        # Thread ID (giữ context hội thoại)
         thread_id = f"thread_{user_id}"
         
         # Configuration for agent
@@ -782,7 +781,10 @@ if __name__ == "__main__":
         logger.info("=" * 80)
         
         asyncio.run(start_consumer())
-        
+        #loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
+        #asyncio.set_event_loop(loop)
+        #loop.run_until_complete(start_consumer())
+        #Windows mặc định dùng ProactorEventLoop, nhưng psycopg async không tương thích. ép buộc dùng SelectorEventLoop
     except KeyboardInterrupt:
         logger.info("🧹 Worker stopped by user")
     except Exception as e:
