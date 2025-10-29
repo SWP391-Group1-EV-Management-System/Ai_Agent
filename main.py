@@ -1,4 +1,3 @@
-
 """
 🚀 Production-Ready LangGraph AI Worker with RabbitMQ & Redis
 Enterprise-grade distributed agent system for LangGraph 1.0.0
@@ -15,11 +14,12 @@ import os
 import logging
 import sys
 import signal
+import httpx
 from typing import Dict, Any, List, Optional, Annotated
 from datetime import datetime
 from hashlib import md5
 from contextlib import suppress, asynccontextmanager
-
+from datetime import datetime, timezone
 # Message Broker & Cache
 import aio_pika
 from aio_pika import DeliveryMode, ExchangeType
@@ -71,6 +71,7 @@ class Config:
     AI_QUEUE_PREFIX: str = os.getenv("AI_QUEUE_PREFIX", "ai_jobs_")
     DLX_NAME: str = os.getenv("DLX", "ai_dlx")
     DLQ_NAME: str = "ai_jobs.dlq"
+    SPRING_CHECK_TOKEN_URL : str = os.getenv("SPRING_CHECK_TOKEN_URL")
     
     # Performance
     LLM_CONCURRENCY: int = int(os.getenv("LLM_CONCURRENCY", "5"))
@@ -186,14 +187,21 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add]  # ✅ Use 'add' operator to APPEND messages
     user_id: str
     thread_id: str
+    jwt: str  # thêm jwt vào state cần thiết
 
 # ==================== AGENT NODES ====================
 async def call_model(state: AgentState): #state ở đây là dict giống như Map trong java
     """Trái tim của agent - gọi LLM với messages đã có"""
-    messages = state["messages"] #lấy value của key messages trong state, tức là các tin nhắn mới được gửi đến agent
+    messages = state["messages"]
+    user_id = state.get("user_id", "unknown")
+    jwt = state.get("jwt", None)  # ✅ Lấy JWT từ state
     
-    # gán system prompt vào systemMessages (SystemMessage, HumanMessage, AIMessage)
-    system_msg = SystemMessage(content=config.SYSTEM_PROMPT)
+    # ✅ Thêm JWT vào system prompt để LLM biết
+    system_content = config.SYSTEM_PROMPT
+    if jwt:
+        system_content += f"\n\n🔐 **Authentication Context:**\nUser JWT Token (use this for API calls): `{jwt}`"
+    
+    system_msg = SystemMessage(content=system_content)
     
     # Remove any existing system messages to avoid duplicates
     messages_without_system = [m for m in messages if not isinstance(m, SystemMessage)] 
@@ -248,16 +256,21 @@ async def create_agent_executor():
     """
     # PostgreSQL checkpointer
     checkpointer = None
-    if POSTGRES_AVAILABLE and config.DATABASE_URL: #khởi tạo checkpointer tăng tính bền vững
+    checkpointer_cm = None  # Lưu context manager để cleanup sau
+    
+    if POSTGRES_AVAILABLE and config.CHECKPOINTER_DB_DSN: #khởi tạo checkpointer tăng tính bền vững
         try:
-            checkpointer_cm = AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) # tạo context manager cho checkpointer
-            checkpointer = await checkpointer_cm.__aenter__() # khởi tạo checkpointer bất đồng bộ ( lúc này context manager đã vào trạng thái active) # __aenter__() là hàm để chuẩn bị tài nguyên, khởi động để sử dụng 
+            # ✅ FIX: from_conn_string() trả về context manager, cần await __aenter__()
+            checkpointer_cm = AsyncPostgresSaver.from_conn_string(config.CHECKPOINTER_DB_DSN)
+            checkpointer = await checkpointer_cm.__aenter__()
+            # Giờ checkpointer mới là AsyncPostgresSaver thực sự
             await checkpointer.setup() # sẵn sàng sử dụng 
             logger.info("✅ PostgreSQL checkpointer enabled")
         except Exception as e:
             logger.warning(f"⚠️  Failed to setup PostgreSQL checkpointer: {e}")
             logger.info("📝 Running without persistence")
             checkpointer = None
+            checkpointer_cm = None
     else:
         logger.info("📝 Running without checkpointer (no persistence)")
     
@@ -265,64 +278,96 @@ async def create_agent_executor():
     tool_node = ToolNode(TOOLS) 
     
     # ✅ CRITICAL FIX: Wrap tool node to maintain conversation flow
-    async def tool_node_func(state: AgentState):
+    async def tool_node_with_context(state: AgentState):
+        """
+        Tool node wrapper tự động inject user_id và jwt vào tool calls
+        """
         print("\n" + "=" * 80)
-        print("🔧 TOOL NODE CALLED")
-        original_messages = state['messages'] # lấy toàn bộ messages hiện tại trước khi gọi tool
-        print(f"📊 Messages before tools: {len(original_messages)}")
+        print("🔧 TOOL NODE WITH CONTEXT CALLED")
         
-        # Debug: liệt kê tin nhắn đang có trước khi gọi tool
-        for i, msg in enumerate(original_messages):
-            msg_type = type(msg).__name__
-            print(f"  [{i}] {msg_type}")
-            ''' [0] SystemMessage
-                [1] HumanMessage
-                [2] AIMessage'''
+        messages = state['messages']
+        user_id = state.get('user_id')
+        jwt = state.get('jwt')
         
-        try:
-            # gọi tools ( ở bước này LLM đã phân tích và đưa ra tools cần và tham số phục vụ cho tools rồi)
-            result = await tool_node.ainvoke(state) # ainvoke này là hàm của thu viện langgraph
-            tool_messages = result.get('messages', [])
+        print(f"📊 Context available:")
+        print(f"   - user_id: {user_id}")
+        print(f"   - jwt: {jwt[:20] if jwt else 'None'}...")
+        
+        # Lấy last message (AIMessage with tool_calls)
+        last_message = messages[-1]
+        
+        if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
+            print("⚠️ No tool calls found!")
+            return {"messages": []}
+        
+        tool_messages = []
+        
+        for tool_call in last_message.tool_calls:
+            tool_name = tool_call['name']
+            tool_args = tool_call['args'].copy()  # Copy để không modify original
+            tool_id = tool_call['id']
             
-            print(f"✅ Tool execution completed")
-            print(f"📦 Tool returned {len(tool_messages)} new messages")
+            print(f"\n🛠️ Processing tool: {tool_name}")
+            print(f"   Original args: {tool_args}")
             
-            # Debug tool results
-            for msg in tool_messages:
-                msg_type = type(msg).__name__ # in ra kiểu message "__name__" trã về tên lớp dạng string
-                content_preview = str(msg.content)[:100] if hasattr(msg, 'content') else str(msg)[:100] # in ra nội dung của toolMessage nếu có hoặc cả msg, content là phần tin nhắn chính
-                print(f"   → {msg_type}: {content_preview}...")
+            # ✅ INJECT CONTEXT vào tool args
+            if tool_name == "create_booking":
+                # Override user parameter với user_id thật từ state
+                if user_id:
+                    tool_args['user'] = user_id
+                    print(f"   ✅ Injected user_id: {user_id}")
+                else:
+                    print(f"   ⚠️ No user_id in state!")
             
+            print(f"   Final args: {tool_args}")
             
-            print(f"🔗 Returning {len(tool_messages)} tool messages (LangGraph will merge)")
-            print("=" * 80 + "\n")
+            # Execute tool với args đã inject
+            try:
+                from tools.register_tools import TOOLS
+                
+                # Find tool by name
+                tool_func = None
+                for t in TOOLS:
+                    if t.name == tool_name:
+                        tool_func = t
+                        break
+                
+                if not tool_func:
+                    result = json.dumps({
+                        "error": f"Tool {tool_name} not found"
+                    }, ensure_ascii=False)
+                else:
+                    # Call tool với args đã inject context
+                    result = await tool_func.ainvoke(tool_args)
+                
+                print(f"   ✅ Tool result: {str(result)[:100]}...")
+                
+            except Exception as e:
+                print(f"   ❌ Tool error: {e}")
+                result = json.dumps({
+                    "error": str(e)
+                }, ensure_ascii=False)
             
-            # # mô hình chạy bất đồng bộ này sẽ làm nhiều node (worker) chạy song song để xứ lý vấn đề
-            # do đó node này cần trã đúng kết quả về cho node chính (agent) để nó tổng hợp, để tránh bị ghi đè chỉ gửi phần content toolMessage
-            return {"messages": tool_messages}
-            
-        except Exception as e:
-            print(f"❌ TOOL NODE ERROR: {e}")
-            logger.error(f"Tool node error: {e}", exc_info=True)
-            raise
+            # Create ToolMessage
+            tool_messages.append(
+                ToolMessage(
+                    content=str(result),
+                    tool_call_id=tool_id,
+                    name=tool_name
+                )
+            )
+        
+        print(f"\n🔗 Returning {len(tool_messages)} tool messages")
+        print("=" * 80 + "\n")
+        
+        return {"messages": tool_messages}
     
-    # Create workflow with Annotated reducer for messages
-    from typing import Annotated
-    from operator import add
-    
-    # ✅ CRITICAL FIX: Define state with proper reducer
-    class FixedAgentState(TypedDict):
-        """ Agent state với reducer để nối messages đúng cách """
-        messages: Annotated[List[BaseMessage], add]  # Use 'add' to APPEND messages
-        user_id: str
-        thread_id: str
-    
-    workflow = StateGraph(FixedAgentState) # khai báo workflow với state đã fix
+    workflow = StateGraph(AgentState) # khai báo workflow với state đã fix
     #StateGraph đảm bảo luồng công việc của agent được quản lý đúng cách
     # Add nodes
     workflow.add_node("agent", call_model) #node này gọi LLM trã về câu trả lời và toolCalls nếu có
-    workflow.add_node("tools", tool_node_func) #node này gọi tools nếu LLM yêu cầu
-    
+    workflow.add_node("tools", tool_node_with_context) #node này gọi tools nếu LLM yêu cầu
+  
     # bắt đầu luồng công việc
     workflow.add_edge(START, "agent") 
     # kiểm tra có toolMessage không để quyết định chạy tiếp hay dừng
@@ -345,11 +390,12 @@ async def create_agent_executor():
         app = workflow.compile()
         logger.info(f"✅ Agent created with {len(TOOLS)} tools (no persistence)")
     #app là executor để gọi agent và nó được python gói lại thành một Object
-    return app, checkpointer 
+    return app, checkpointer, checkpointer_cm  # Trả về cả context manager
 
 # Tạo Global instance
 agent_executor = None
-checkpointer = None
+checkpointer = None # biến này thao tác chính với PostGre (thêm xóa sửa)
+checkpointer_cm = None  # Biến toàn cục cho context manager, dùng để mở đóng kết nối nên cần được gán là global (fix do hệ đều hành window  )
 # được gán ở start_consumer()
 
 # ==================== UTILITIES ====================
@@ -418,11 +464,42 @@ async def save_message(user_id: str, role: str, content: str):
         )
         await session.commit()
 
+async def clear_checkpoint(user_id: str):
+    """
+    Xóa checkpoint (trạng thái hội thoại) của người dùng khỏi Postgres checkpointer.
+    Điều này giúp agent không reuse lại context cũ cho lần chat mới.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text("DELETE FROM checkpoints WHERE thread_id = :thread_id "),
+                {"thread_id": f"thread_{user_id}"}
+            )
+            await session.execute(
+                text("DELETE FROM checkpoint_blobs WHERE thread_id = :thread_id "),
+                {"thread_id": f"thread_{user_id}"}
+
+            )
+            await session.execute(
+                text("DELETE FROM checkpoint_writes WHERE thread_id = :thread_id "),
+                {"thread_id": f"thread_{user_id}"}
+            )       
+            await session.commit()
+        logger.info(f"✅ Cleared checkpoint for {user_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to clear checkpoint for {user_id}: {e}", exc_info=True)
+async def get_user_jwt(user_email: str, redis):
+    """Lấy JWT từ Redis"""
+    jwt = await redis.get(f"jwt:{user_email}")
+    if jwt:
+        return jwt
+    print(f"⚠️ No JWT found for user email: {user_email}")
+    return None
 # ==================== AGENT EXECUTION ====================
 async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> str:
     """
-    Invoke LangGraph agent with memory and checkpointing
-    Updated for LangGraph 1.0.0
+    Gọi agent cùng với checkpointer, memory lịch sử chat, Phiên làm việc của 1 worker gồm nhiều node 
+    (LangGraph 1.0.0)
     """
     try:
         # Tải lịch sử chat
@@ -448,18 +525,20 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
                 "thread_id": thread_id
             }
         }
-        
-        # Invoke agent
+        jwt = await get_user_jwt(user_id, redis)  # Lấy JWT từ Redis
+        # gọi agent 
         result = await asyncio.wait_for(
             agent_executor.ainvoke(
                 {
                     "messages": messages,
                     "user_id": user_id,
-                    "thread_id": thread_id
+                    "thread_id": thread_id, # thread_id này để agent đọc lại context hội thoại
+                    "jwt": jwt
                 },
-                config=config_dict
+                config=config_dict # cấu hình thread_id để cho các node trong agent dùng chung, giữ context xuyên suốt workflow, để tránh ghi đè thread_id nếu có nhiều người dùng cùng hội thoại một lúc
+                # quản lý runtime, workflow là chính 
             ),
-            timeout=config.JOB_TIMEOUT_SEC
+            timeout=config.JOB_TIMEOUT_SEC # giới hạn thời gian agent xử lý 
         )
         
         # Extract final response
@@ -467,41 +546,41 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
         response_text = final_message.content if hasattr(final_message, 'content') else str(final_message)
         
         logger.info(f"✅ Agent response for user {user_id}: {response_text[:100]}...")
-        return response_text
+        return response_text # trả kết quả
         
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError: # bắt lỗi nếu agent chạy quá thời gian 
         logger.error(f"⏱️ Agent timeout for user {user_id}")
-        return "Xin lỗi, yêu cầu của bạn mất quá nhiều thời gian xử lý. Vui lòng thử lại."
+        return "Xin lỗi, yêu cầu của anh/chị mất quá nhiều thời gian xử lý. Vui lòng thử lại."
     except Exception as e:
-        logger.error(f"❌ Agent error for user {user_id}: {e}", exc_info=True)
-        return "Xin lỗi, đã xảy ra lỗi khi xử lý yêu cầu của bạn."
+        logger.error(f"❌ Agent error for user {user_id}: {e}", exc_info=True) # gửi đầy đủ thông tin log 
+        return "Xin lỗi, đã xảy ra lỗi khi xử lý yêu cầu của anh/chị."
 
 # ==================== MESSAGE HANDLER ====================
 async def handle_message(
     redis: aioredis.Redis,
-    payload: Dict[str, Any],
-    message: aio_pika.IncomingMessage
+    payload: Dict[str, Any], # đoạn mã json được giải mã thành dict (hash map in java)
+    message: aio_pika.IncomingMessage # giao tiếp trung gian qua aio_pika, không thể gọi trực tiếp đến RabbitMQ vì không có thư viện 
 ):
-    """Core message handler with idempotency and retries"""
+    """Bộ xử lý chính cho mỗi tin nhắn từ RabbitMQ, đảm bảo idempotency và retry logic, DLQ"""
     job_id = payload["job_id"]
     user_id = payload["user_id"]
     user_message = payload["text"]
     
-    # 1. Idempotency check
+    # 1. Kiểm tra job đã hoàn thành chưa 
     if await is_job_completed(redis, job_id):
         logger.info(f"⏭️ Job {job_id} already completed (idempotent)")
-        await message.ack()
+        await message.ack() # xóa khỏi queue
         return
     
-    # 2. Acquire distributed lock
+    # 2. Kiểm tra nếu có worker khác đã lấy
     lock_key = f"lock:job:{job_id}"
     if not await acquire_lock(redis, lock_key, config.LOCK_TTL_MS):
         logger.info(f"🔒 Job {job_id} locked by another worker")
-        await message.ack()
+        await message.ack() 
         return
     
     try:
-        # 3. Double-check idempotency
+        # Kiểm tra lại
         if await is_job_completed(redis, job_id):
             logger.info(f"⏭️ Job {job_id} completed during lock acquisition")
             await message.ack()
@@ -509,48 +588,48 @@ async def handle_message(
         
         logger.info(f"🔄 Processing job {job_id} for user {user_id}")
         
-        # 4. Invoke agent
+        # Gọi agent
         reply = await invoke_agent(user_id, user_message, redis)
-        
-        # 5. Save to database
+
+        # Lưu vào cơ sở dữ liệu
         await save_message(user_id, "user", user_message)
         await save_message(user_id, "assistant", reply)
-        
-        # 6. Mark as completed
+
+        # Đánh dấu là đã hoàn thành
         await mark_job_completed(redis, job_id)
-        
-        # 7. ACK message
+        # ACK message
         await message.ack()
         logger.info(f"✅ Job {job_id} completed successfully")
         
     except Exception as e:
         logger.error(f"❌ Error processing job {job_id}: {e}", exc_info=True)
-        
+        # khi có lỗi xảy ra thử lại 
         # Retry logic
-        headers = dict(message.headers) if message.headers else {}
-        retries = int(headers.get("x-retries", 0))
+        headers = dict(message.headers) if message.headers else {} #lấy header từ rabbitmq message, để lưu số lần thử lại 
+        retries = int(headers.get("x-retries", 0)) # lấy nếu có hoặc gán bằng 0 
         
-        if retries < config.MAX_RETRIES:
+        if retries < config.MAX_RETRIES: # chỉ thử lại số lần có hạn 
             headers["x-retries"] = retries + 1
             headers["x-error"] = str(e)[:200]
             await message.nack(requeue=True)
             logger.warning(f"⚠️ Job {job_id} requeued (retry {retries + 1}/{config.MAX_RETRIES})")
         else:
-            # Send to DLQ
+            # chuyển vào Dead Letter Queue nếu vượt quá số lần thử, nơi lưu tin nhắn bị lỗi 
             dlx_msg = aio_pika.Message(
                 body=message.body,
                 headers={**headers, "x-final-error": str(e)[:500]},
-                delivery_mode=DeliveryMode.PERSISTENT
+                delivery_mode=DeliveryMode.PERSISTENT # Persistent lưu trên ổ đĩa bền vững, Transient lưu trong RAM  
             )
+            # gửi đến channel .default_exchange là nơi phân phối tin nhắn của rabbitmq .publish chọn gửi, tin nhắn sẽ chạy đến key được định nghĩa 
             await message.channel.default_exchange.publish(
                 dlx_msg,
                 routing_key=config.DLQ_NAME
             )
-            await message.ack()
+            await message.ack() # bất lực ack nó ra 
             logger.error(f"☠️ Job {job_id} sent to DLQ after {config.MAX_RETRIES} retries")
-    
     finally:
-        await release_lock(redis, lock_key)
+        await release_lock(redis, lock_key) # giải phóng khóa trong redis dù thành công hay thất bại
+        await clear_checkpoint(user_id) # xóa checkpoint để tránh reuse context cũ
 
 # ==================== CONSUMER ====================
 async def consume_shard(
@@ -559,25 +638,28 @@ async def consume_shard(
     shard_id: int,
     stop_event: asyncio.Event
 ):
-    """Consume messages from a specific queue shard"""
+    """Đăng ký consumer cho mỗi shard (queue), và gọi handle_message xử lý tin nhắn"""
     logger.info(f"🚀 Worker shard-{shard_id} starting on queue '{queue.name}'")
     
-    async def on_message(msg: aio_pika.IncomingMessage):
-        async with msg.process(ignore_processed=True):
+    async def on_message(msg: aio_pika.IncomingMessage): # truyền vào đối tượng msg từ rabbitmq
+        async with msg.process(ignore_processed=True): # tự động ack sau khi xử lý xong, ignore_processed tránh lỗi nếu đã ack rồi
             try:
-                payload = json.loads(msg.body.decode())
+                payload = json.loads(msg.body.decode()) # giải mã json thành dict
                 logger.debug(f"[shard-{shard_id}] 📩 Received: {payload}")
-                await handle_message(redis, payload, msg)
+                await handle_message(redis, payload, msg) # gửi cho agent xử lý
             except json.JSONDecodeError as e:
                 logger.error(f"[shard-{shard_id}] ❌ Invalid JSON: {e}")
                 await msg.ack()
             except Exception as e:
                 logger.error(f"[shard-{shard_id}] ❌ Handler error: {e}", exc_info=True)
-                raise
+                raise # ném lỗi ra hàm msg.process để xử lý retry và DLQ
     
-    consumer_tag = await queue.consume(on_message, no_ack=False)
+    consumer_tag = await queue.consume(on_message, no_ack=False) # đăng ký tự động gọi hàm on_message khi có tin nhắn mới từ queue, no_ack = false để worker tự ack sau khi xử lý xong
+    # on_message là callback function của thư viện aio-pika, thư viện sẽ tự truyền tham số 
+    #no_ack=False chờ (msg.process(ignore_processed=True) ack, hoặc hàm handle_message ack) để true rabbitMQ giao rồi xóa luôn khỏi queue
     logger.info(f"✅ Shard-{shard_id} consumer registered (tag: {consumer_tag})")
     
+    # dừng khi có tín hiệu
     try:
         await stop_event.wait()
         logger.info(f"[shard-{shard_id}] 🛑 Stop signal received")
@@ -593,27 +675,29 @@ async def consume_shard(
 
 # ==================== INITIALIZATION ====================
 async def init_infrastructure():
-    """Initialize RabbitMQ, Redis, PostgreSQL connections"""
+    """Khởi tạo kết nối RabbitMQ, Redis"""
     try:
         logger.info("🔌 Initializing infrastructure...")
         
         # RabbitMQ
-        conn = await aio_pika.connect_robust(
+        conn = await aio_pika.connect_robust( # aio_pika.connect_robust() kết nối lại tự động nếu mất kết nối
             config.RABBITMQ_URL,
             timeout=10,
             client_properties={"connection_name": "ai_worker"}
         )
-        channel = await conn.channel()
-        await channel.set_qos(prefetch_count=config.PREFETCH_COUNT)
+        # tạo channel nhỏ trong kết nối lớn conn, đủ sử dụng và tiết kiệm tài nguyên 
+        channel = await conn.channel() #tạo chanel trong conn, đường ống nhỏ 
+        await channel.set_qos(prefetch_count=config.PREFETCH_COUNT) # thiết lập số lượng message tối đa mà worker có thể lấy cùng lúc, giúp phân tán message đều cho các worker
+        # mỗi worker sẽ được rabbitMQ rót cho 10 message nhưng khi xử lý thì mới lock message đó ( tức là nếu worker khác xong cũng có thể lấy message của worker kia xử lý tiếp)
         
         # Declare DLX and DLQ
-        dlx = await channel.declare_exchange(
-            config.DLX_NAME,
-            ExchangeType.DIRECT,
-            durable=True
+        dlx = await channel.declare_exchange( # bưu điện nhận tin nhắn lỗi
+            config.DLX_NAME, # tên DLX
+            ExchangeType.DIRECT, # kiểu direct để routing key khớp mới gửi đến queue
+            durable=True # tồn tại lâu dài 
         )
-        dlq = await channel.declare_queue(config.DLQ_NAME, durable=True)
-        await dlq.bind(dlx, routing_key=config.DLQ_NAME)
+        dlq = await channel.declare_queue(config.DLQ_NAME, durable=True) # tạo nơi nhận tin nhắn chết (dead letter queue)
+        await dlq.bind(dlx, routing_key=config.DLQ_NAME) # gán địa chỉ cho bưu điện DLX giao tin nhắn chết đến DLQ
         
         # Redis
         redis = await aioredis.from_url(
@@ -622,8 +706,8 @@ async def init_infrastructure():
             max_connections=50
         )
         await redis.ping()
-        
-        logger.info("✅ Infrastructure initialized: RabbitMQ, Redis, PostgreSQL")
+
+        logger.info("✅ Infrastructure initialized: RabbitMQ, Redis")
         return conn, channel, redis
         
     except Exception as e:
@@ -633,12 +717,12 @@ async def init_infrastructure():
 # ==================== MAIN CONSUMER ====================
 async def start_consumer():
     """Main consumer loop with graceful shutdown"""
-    global agent_executor, checkpointer
+    global agent_executor, checkpointer, checkpointer_cm  
     
-    # Initialize agent
-    agent_executor, checkpointer = await create_agent_executor()
+    # chứa workflow , thao tác với db, cổng kết nối
+    agent_executor, checkpointer, checkpointer_cm = await create_agent_executor() 
     
-    # Initialize infrastructure
+    # Initialize các kết nối 
     conn, channel, redis = await init_infrastructure()
     
     # Stop event
@@ -647,15 +731,15 @@ async def start_consumer():
     def signal_handler(sig, frame):
         logger.info(f"🛑 Received signal {sig}, initiating shutdown...")
         stop_event.set()
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Create consumer tasks
-    tasks = []
-    for shard in range(config.SHARD_COUNT):
+    # sig mã tín hiệu SIGINT = 2, SIGTERM = 15| bắt buộc phải truyền đủ tham số sig, frame tương thích với thư viện signal của python
+    signal.signal(signal.SIGINT, signal_handler) # bắt tín hiệu ctrl+c để dừng
+    signal.signal(signal.SIGTERM, signal_handler) # bắt tín hiệu dừng từ hệ điều hành ( docker, hoặc hệ điều hành gọi kill)
+    #signal_handler là callback function
+    # Tạo worker cho mỗi shard (consumers)
+    tasks = [] # giỏ đựng công việc 
+    for shard in range(config.SHARD_COUNT): # tạo ra 8 task cho mỗi worker (worker là một lần python main.py, có thể tạo nhiều worker bằng docker) 
         queue_name = f"{config.AI_QUEUE_PREFIX}{shard}"
-        queue = await channel.declare_queue(
+        queue = await channel.declare_queue( # tạo 8 queue như đã định nghĩa trong config nếu chưa có 
             queue_name,
             durable=True,
             arguments={
@@ -663,115 +747,155 @@ async def start_consumer():
                 "x-dead-letter-routing-key": config.DLQ_NAME
             }
         )
-        task = asyncio.create_task(
-            consume_shard(redis, queue, shard, stop_event)
+        task = asyncio.create_task( # tạo 8 task chạy song song( trên 1 worker )
+            consume_shard(redis, queue, shard, stop_event) # mỗi task lắng nghe một queue cố định
         )
         tasks.append(task)
     
     logger.info(f"🎯 Started {len(tasks)} shard consumers")
     
     try:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True) #return_exceptions=True nếu 1 task bị lỗi thì các task khác vẫn chạy tiếp
+        # công dụng asyncio.gather() chạy nhiều task cùng lúc, và giữ nguyên chương trình, chỉ kết thúc và end task khi có tín hiệu dừng
     except asyncio.CancelledError:
-        logger.info("⏹ Consumer tasks cancelled")
+        logger.info("X Consumer tasks cancelled")
     finally:
         logger.info("🧹 Cleaning up connections...")
         await channel.close()
         await conn.close()
         await redis.aclose()
-        if checkpointer:
-            await checkpointer.aclose()
+        # Đóng checkpointer đúng cách qua context manager
+        if checkpointer_cm:
+            try:
+                await checkpointer_cm.__aexit__(None, None, None)
+                logger.info("✅ Checkpointer closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing checkpointer: {e}")
         logger.info("✅ Shutdown complete")
-
 # ==================== FASTAPI APP ====================
-@asynccontextmanager
+@asynccontextmanager # định nghĩa hàm bất đồng bộ dùng làm context manager ( người giữ cửa kết nối)
 async def lifespan(app: FastAPI):
-    logger.info("🌟 FastAPI starting up...")
-    yield
-    logger.info("🌙 FastAPI shutting down...")
+    logger.info("🌟 FastAPI starting up...") # dòng này sẽ chạy khi khởi động vì nằm trước yield
+    yield #app chạy ở đây và giữ chờ tin hiệu tắt mới chạy dòng dưới 
+    logger.info("🌙 FastAPI shutting down...") 
 
-app = FastAPI(
-    title="AI Message Gateway",
+app = FastAPI( # tạo kết nối FastAPI
+    title="AI Message Gateway", # các thông tin này hiện lên UI swagger
     description="Production-grade LangGraph 1.0.0 agent system",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan # gán context manager
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], # Cho phép TẤT CẢ website gọi 
+    #"https://abdcjddahdaj.com",   ← Chỉ riêng domain này
+    #"http://abdcjddahdaj.com"     ← Nếu cần cả HTTP
+
+    allow_credentials=True, # Cho phép gửi cookie/token  
+    allow_methods=["*"], # Cho phép TẤT CẢ method (GET, POST, PUT...)
+    allow_headers=["*"], # Cho phép TẤT CẢ headers
 )
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "2.0.0",
         "langgraph": "1.0.0"
     }
 
 @app.post("/send_message")
-async def send_message(request: Request):
+async def send_message(request: Request): # nhận toàn bộ request từ client
     """Enqueue user message for processing"""
     try:
-        data = await request.json()
-        user_id = data.get("user_id")
-        text = data.get("message")
-        
-        if not user_id or not text:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required fields: user_id, message"
+        cookie_jar = request.cookies
+        jwt_token = cookie_jar.get("jwt")
+        if not jwt_token:
+            raise HTTPException(status_code=401, detail="authentication failed")       
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                config.SPRING_CHECK_TOKEN_URL,
+                cookies={"jwt": jwt_token}
             )
-        
-        conn, channel, redis = await init_infrastructure()
-        
-        try:
-            job_id = str(uuid.uuid4())
-            payload = {
-                "job_id": job_id,
-                "user_id": user_id,
-                "text": text,
-                "timestamp": datetime.utcnow().isoformat()
-            }
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="authentication failed")
+        else:
+            userName = response.text.strip()
+
+            data = await request.json()
+            user_id = userName
+            text = data.get("message")
             
-            queue_name = user_shard_queue(user_id)
+            if not text:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing required fields: message"
+                )
             
-            await channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=json.dumps(payload).encode(),
-                    delivery_mode=DeliveryMode.PERSISTENT,
-                    content_type="application/json"
-                ),
-                routing_key=queue_name
-            )
+            conn, channel, redis = await init_infrastructure()
             
-            logger.info(f"📨 Enqueued job {job_id} for user {user_id} to {queue_name}")
+            try:
+                # set JWT vào redis để worker sử dụng gọi API BE 
+                await redis.setex(
+                    f"jwt:{userName}", 
+                    600, 
+                    jwt_token
+                )
+                job_id = str(uuid.uuid4())
+                payload = {
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "text": text,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                
+                queue_name = user_shard_queue(user_id) # phân tán vào một queue cố định
+                
+                await channel.default_exchange.publish(
+                    aio_pika.Message( # tạo object message để gửi
+                        body=json.dumps(payload).encode(), #chuyển dict thành json rồi mã hóa thành bytes vì rabbitmq chỉ nhận đc dữ liệu bytes
+                        delivery_mode=DeliveryMode.PERSISTENT, # lưu bền vững vào ổ đĩa
+                        content_type="application/json"
+                    ),
+                    routing_key=queue_name # gửi đến queue đã phân shard ở trên
+                )
+                
+                logger.info(f"📨 Enqueued job {job_id} for user {user_id} to {queue_name}")
+                
+                return JSONResponse({
+                    "status": "ok",
+                    "job_id": job_id,
+                    "queue": queue_name,
+                    "message": "Job enqueued successfully"
+                })
+                
+            finally: # đóng kết nối, dù thành công hay lỗi, mỗi request sẽ đều tạo connect mới và đóng, tránh giữ kết nối lâu tốn tài nguyên
+                await channel.close()
+                await conn.close()
+                await redis.aclose()
             
-            return JSONResponse({
-                "status": "ok",
-                "job_id": job_id,
-                "queue": queue_name,
-                "message": "Job enqueued successfully"
-            })
-            
-        finally:
-            await channel.close()
-            await conn.close()
-            await redis.aclose()
-        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ API error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/result/{job_id}")
+async def get_result(job_id: str):
+    redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
+    status = await redis.get(f"job:{job_id}:status")
+    result = await redis.get(f"job:{job_id}:result")
+    await redis.aclose()
+
+    if status == "ok":
+        return {"status": "ok", "result": result}
+    else:
+        raise HTTPException(status_code=403, detail="authentication failed")
+
 # ==================== ENTRY POINT ====================
-if __name__ == "__main__":
+if __name__ == "__main__": # chỉ chạy được khi run file này trực tiếp, không chạy được khi import
     try:
         logger.info("=" * 80)
         logger.info("🚀 Starting AI Worker (LangGraph 1.0.0)")
@@ -780,13 +904,23 @@ if __name__ == "__main__":
         logger.info(f"   Concurrency: {config.LLM_CONCURRENCY}")
         logger.info("=" * 80)
         
-        asyncio.run(start_consumer())
-        #loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
-        #asyncio.set_event_loop(loop)
-        #loop.run_until_complete(start_consumer())
-        #Windows mặc định dùng ProactorEventLoop, nhưng psycopg async không tương thích. ép buộc dùng SelectorEventLoop
+        #asyncio.run(start_consumer())
+        loop = asyncio.SelectorEventLoop(selectors.SelectSelector()) # ép window dùng SelectorEventLoop
+        asyncio.set_event_loop(loop) # khởi tạo event loop
+        loop.run_until_complete(start_consumer()) # chạy chính, chờ đến khi hàm start_consumer kết thúc 
+        # hàm start_consumer sẽ chạy và gán task vào queue chờ tín hiệu dừng 
+        #Windows mặc định dùng ProactorEventLoop, nhưng psycopg async không tương thích. ép buộc dùng SelectorEventLoop ( do không tương thích với psycopg thư viện PostGreSQL async)
     except KeyboardInterrupt:
         logger.info("🧹 Worker stopped by user")
     except Exception as e:
         logger.error(f"🔥 Worker crashed: {e}", exc_info=True)
         sys.exit(1)
+    #thêm cơ chế xóa checkpointer khi đủ 1 ngày không sử dụng để tránh tốn dung lượng db
+
+
+    # thực ra mỗi lần chạy (python main.py) đó mới là 1 worker, hợp lý khi sử dụng lock
+    # 1 worker sẽ tạo ra 8 task, mỗi task lắng nghe 1 queue cố định, và nó sẽ xử lý request từ queue đó
+    # mỗi task với cấu hình hiện tại đang được phép lấy 10 message cùng lúc, và xử lý đồng thời 5 request LLM cùng lúc ( nếu các task khác không sử dụng llm)
+    # và 5 llm được khai báo đó, các task sẽ sử dụng chung với nhau 
+    
+    #Yield & Resume: đây là cơ chế giúp cho hàm bất đồng bộ hoạt động trên một thread ( luồng)

@@ -3,103 +3,73 @@ Tool Registration Module - FIXED (No Recursion)
 Register all available tools for the LangGraph agent
 """
 
+from fastapi import HTTPException
 from langchain_core.tools import tool
 from typing import List
 import json
 import asyncio
 
+
 # ✅ Import API functions với alias để tránh conflict
 from tools.API_BE import (
-    listUser_api,  # ← API function thực
-    add_user_to_api  # ← API function thực
+    create_booking_api
 )
 
-# ==================== WRAPPED API TOOLS ====================
-
+# =================== BOOKING TOOLS ====================
 @tool
-async def list_users(query: str = "") -> str:
+async def create_booking(user: str, charging_post: str, car: str, jwt: str) -> str:
     """
-    Liệt kê danh sách người dùng từ hệ thống backend.
-    
-    Sử dụng tool này KHI user hỏi về:
-    - "danh sách người dùng"
-    - "có bao nhiêu user"
-    - "liệt kê users"
-    - "xem thông tin người dùng"
-    
-    Args:
-        query: Tìm kiếm người dùng (optional, không sử dụng)
-    
-    Returns:
-        Danh sách người dùng đầy đủ
-    """
-    try:
-        print("=" * 80)
-        print("🔧 TOOL CALLED: list_users")
-        print("Đang gọi API lấy danh sách user...")
-
-        # ✅ Gọi API function (không cần limit)
-        result = await listUser_api(query)
-
-        print(f"📦 API Response type: {type(result)}")
-        print(f"📦 API Response length: {len(result) if result else 0}")
-        print(f"📦 API Response preview: {result[:200] if result else 'EMPTY'}")
-        print("=" * 80)
-        
-        # ✅ Return result trực tiếp (đã format sẵn từ API)
-        if result and result.strip():
-            return result
-        else:
-            return "❌ Không thể lấy danh sách người dùng từ hệ thống."
-            
-    except Exception as e:
-        error_msg = f"❌ Lỗi khi gọi API lấy danh sách user: {str(e)}"
-        print(f"❌ TOOL ERROR: {error_msg}")
-        return error_msg
-
-
-@tool
-async def add_user(userName: str, password: str, role: str = "USER") -> str:
-    """
-    Thêm người dùng mới vào hệ thống backend.
+    Tạo booking đặt chỗ cho trụ sạc xe điện
     
     Sử dụng tool này KHI user muốn:
-    - "thêm user mới"
-    - "tạo tài khoản"
-    - "đăng ký người dùng"
+    - "đặt chỗ trụ sạc"
+    - "book trụ sạc"
+    - "đặt lịch sạc xe"
+    - "tôi muốn sạc xe tại trụ X"
+    - "tôi muốn đặt trạm sạc"
+    LƯU Ý: phải xác nhận với người dùng thông tin và yêu cầu người dùng nhập "xác nhận" xác nhận trước khi gọi tool này
+            khi user nhập "xác nhận", "ok", "đồng ý", "đặt chỗ" thì mới gọi tool này
+    Kết quả có thể là:
+    - Booking thành công: Người dùng có thể đến trạm ngay
+    - Vào hàng chờ: Người dùng phải chờ đến lượt (sẽ có vị trí trong hàng chờ)
     
     Args:
-        userName: Tên đăng nhập (bắt buộc)
-        password: Mật khẩu (bắt buộc)
-        role: Vai trò (USER hoặc ADMIN, mặc định: USER)
-    
+        user (str): email người dùng đặt chỗ (lấy tên của user_id đang chat với bot)
+        charging_post (str): Mã trụ sạc - ví dụ: CP001, CP002 (bắt buộc)
+        car (str): Mã xe - ví dụ: CAR_A1, CAR_B2 (bắt buộc)
+        bạn phải gắn chuỗi jwt hợp lệ vào tham số jwt để xác thực người dùng khi gọi API (lấy từ context của cuộc hội thoại, bắt buộc)
+
     Returns:
-        Kết quả thêm người dùng
+        str: Kết quả đặt chỗ (thành công hoặc vị trí hàng chờ)
+    
+    Examples:
+        User: "Tôi muốn đặt chỗ trụ CP001 cho xe CAR_A1"
+        >>> create_booking("email@gmail.com", "CP001", "CAR_A1")
+        "✅ Đặt chỗ thành công! Có thể đến trạm ngay"
+        
+        User: "Book trụ CP002"
+        >>> create_booking("email@gmail.com", "CP002", "CAR_B1")
+        "⏳ Đã thêm vào hàng chờ! Vị trí: #3"
     """
-    try:
-        print("=" * 80)
-        print(f"🔧 TOOL CALLED: add_user")
-        print(f"📝 Parameters: userName={userName}, role={role}")
-        
-        # ✅ Call API function
-        result = await add_user_to_api(
-            userName=userName,
-            password=password,
-            role=role
-        )
-        
-        print(f"📦 API Response: {result[:200] if result else 'EMPTY'}")
-        print("=" * 80)
-        
-        # ✅ Return result trực tiếp
-        return result
-            
-    except Exception as e:
-        error_msg = f"❌ Lỗi khi thêm user {userName}: {str(e)}"
-        print(f"❌ TOOL ERROR: {error_msg}")
-        return error_msg
-
-
+    # ✅ CRITICAL FIX: BỎ try/catch để HTTPException thoát ra ngoài
+    print("=" * 80)
+    print(f"🔧 TOOL CALLED: create_booking")
+    print(f"📝 Parameters: user={user}, charging_post={charging_post}, car={car}")
+    
+    # Gọi API function (không wrap try/catch)
+    print(f"🆔 Retrieved JWT for user {user}")
+    print(f"🔑 Using JWT: {jwt}")
+    result = await create_booking_api(
+        user=user,
+        charging_post=charging_post,
+        car=car,
+        jwt=jwt
+    )
+    
+    print(f"📦 API Response: {result[:200] if result else 'EMPTY'}")
+    print("=" * 80)
+    
+    return result
 # ==================== UTILITY TOOLS ====================
 
 @tool
@@ -148,28 +118,6 @@ def calculate(expression: str) -> str:
         return f"🔢 Kết quả của {expression} = {result}"
     except Exception as e:
         return f"❌ Lỗi tính toán: {str(e)}"
-
-
-@tool
-def get_random_number(min_val: int = 1, max_val: int = 100) -> str:
-    """
-    Tạo số ngẫu nhiên trong khoảng min đến max.
-    
-    Sử dụng khi user hỏi:
-    - "cho em một số ngẫu nhiên"
-    - "random số từ 1 đến 100"
-    
-    Args:
-        min_val: Giá trị nhỏ nhất (mặc định: 1)
-        max_val: Giá trị lớn nhất (mặc định: 100)
-    
-    Returns:
-        Số ngẫu nhiên
-    """
-    import random
-    num = random.randint(min_val, max_val)
-    return f"🎲 Số ngẫu nhiên từ {min_val} đến {max_val}: **{num}**"
-
 
 @tool
 def get_weather(city: str) -> str:
@@ -232,9 +180,7 @@ def search_info(query: str) -> str:
 # ✅ Danh sách tất cả tools (Priority order)
 TOOLS: List = [
     # API Tools (Primary - Ưu tiên cao nhất)
-    list_users,      # Danh sách người dùng
-    add_user,        # Thêm người dùng
-    
+    create_booking,  # Tạo booking trụ sạc
     # Utility Tools (Secondary - Thứ yếu)
     get_current_time,  # Thời gian
     calculate,         # Tính toán
@@ -338,4 +284,4 @@ if __name__ == "__main__":
     
     print("\n✅ Tool registration module ready!")
 
-    
+    #agent dường như đang không nhớ context hội thoại trước đó nữa, cần fix lại
