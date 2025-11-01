@@ -12,7 +12,10 @@ import asyncio
 
 # ✅ Import API functions với alias để tránh conflict
 from tools.API_BE import (
-    create_booking_api
+    create_booking_api,
+    finish_charging_session,
+    view_available_stations_and_post,
+    view_car_of_driver
 )
 
 # =================== BOOKING TOOLS ====================
@@ -59,6 +62,30 @@ async def create_booking(user: str, charging_post: str, car: str, jwt: str) -> s
     # Gọi API function (không wrap try/catch)
     print(f"🆔 Retrieved JWT for user {user}")
     print(f"🔑 Using JWT: {jwt}")
+     # 🧠 Bước 1: Check danh sách xe thật từ backend
+    print("🔍 Kiểm tra quyền sở hữu xe trước khi tạo booking...")
+    car_list_json = await view_car_of_driver(user=user, jwt=jwt)
+    
+    # Nếu API trả về JSON dạng chuỗi, cần parse
+    if isinstance(car_list_json, str):
+        try:
+            car_list = json.loads(car_list_json)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Dữ liệu xe trả về không hợp lệ")
+    else:
+        car_list = car_list_json
+
+    # 🧠 Bước 2: Kiểm tra xem xe người dùng yêu cầu có tồn tại không
+    owned_car_ids = [c.get("car_id") for c in car_list]
+    print(f"🚗 Danh sách xe người dùng: {owned_car_ids}")
+
+    if car not in owned_car_ids:
+        print(f"❌ Xe {car} không thuộc user {user}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Xe {car} không thuộc quyền sở hữu của anh/chị. Vui lòng kiểm tra lại ạ."
+        )
+    print(f"✅ Xe {car} thuộc quyền sở hữu của user {user}, tiếp tục tạo booking...")
     result = await create_booking_api(
         user=user,
         charging_post=charging_post,
@@ -70,6 +97,311 @@ async def create_booking(user: str, charging_post: str, car: str, jwt: str) -> s
     print("=" * 80)
     
     return result
+# =================== VIEW LIST CAR OF USER TOOLS ====================
+@tool
+async def view_list_car_of_user(user: str, jwt: str) -> str:
+    """
+    Xem danh sách xe của người dùng
+    
+    Sử dụng tool này KHI user muốn:
+    - "tôi không nhớ xe của tôi là gì"
+    - "liệt kê các xe đã đăng ký"
+    - "cho tôi biết các xe tôi có"
+    - "hình như xe của tôi là biển số 29A-123.45"
+    Args:
+        user (str): email người dùng (lấy tên của user_id đang chat với bot)
+        bạn phải gắn chuỗi jwt hợp lệ vào tham số jwt để xác thực người dùng khi gọi API (lấy từ context của cuộc hội thoại, bắt buộc)
+
+    Returns:
+        str: Danh sách xe của người dùng
+    
+    Examples:
+        EXAMPLE_1:
+        User: "Cho tôi xem danh sách xe của tôi"
+        >>> view_list_car_of_user("email@gmail.com", "jwt_token")
+        [{"car_id": "CAR_A1", "car_name": "Xe điện 1", "license_plate": "29A-123.45", "chassis_number": "VN123456", "charging_type": "fast"},
+         {"car_id": "CAR_B1", "car_name": "Xe điện 2", "license_plate": "29A-678.90", "chassis_number": "VN654321", "charging_type": "normal"}] 
+        EXAMPLE_2:
+        User: "tôi muốn đặt chỗ với xe biển số 29A-123.45"
+        >>> view_list_car_of_user("email@gmail.com", "jwt_token")
+        [{"car_id": "CAR_A1", "car_name": "Xe điện 1", "license_plate": "29A-123.45", "chassis_number": "VN123456", "charging_type": "fast"},
+        "Đã tìm thấy xe của anh chị, có phải tên xe là 'Xe điện 1' không ạ?"
+        EXAMPLE_3:
+        User: "tôi muốn đặt chỗ với xe biển số 29A-123.45"
+        >>> view_list_car_of_user("email@gmail.com", "jwt_token")
+        [{"car_id": "CAR_A1", "car_name": "Xe điện 1", "license_plate": "29A-99999", "chassis_number": "VN123456", "charging_type": "fast"},
+        "Chưa tìm thấy xe của anh chị, ý anh chị là xe biển số '29A-99999' tên Xe điện 1 đúng không ạ, em thấy mình đang sỡ hữu xe này"
+        
+    """
+    # ✅ CRITICAL FIX: BỎ try/catch để HTTPException thoát ra ngoài
+    print("=" * 80)
+    print(f"🔧 TOOL CALLED: view_list_car_of_user")
+    print(f"📝 Parameters: user={user}")
+    
+    # Gọi API function (không wrap try/catch)
+    print(f"🆔 Retrieved JWT for user {user}")
+    print(f"🔑 Using JWT: {jwt}")
+    result = await view_car_of_driver(
+        user=user,
+        jwt=jwt
+    )
+    
+    print(f"📦 API Response: {result[:200] if result else 'EMPTY'}")
+    print("=" * 80)
+    
+    return result
+# =================== FINISH SESSION TOOL ====================
+@tool
+async def finish_charging(user: str, sessionId: str, kWh: float, jwt: str) -> str:
+    """
+    Kết thúc phiên sạc cho xe điện
+
+    Sử dụng tool này KHI user muốn:
+    - "kết thúc phiên sạc"
+    - "hoàn tất sạc xe"
+    - "thanh toán cho phiên sạc"
+    - "tôi muốn kết thúc sạc tại trụ này"
+    - "tôi muốn đặt trạm sạc"
+    LƯU Ý: phải xác nhận với người dùng thông tin và yêu cầu người dùng nhập "xác nhận" xác nhận trước khi gọi tool này
+            khi user nhập "xác nhận", "ok", "đồng ý", "đặt chỗ" thì mới gọi tool này
+    Kết quả có thể là:
+    - Kết thúc phiên sạc thành công! anh/chị có thể thanh toán rồi ạ...!
+    - Kết thúc phiên sạc không thành công! xin lỗi anh/chị vì sự bất tiện này...!
+    
+    Args:
+        user (str): email người dùng đặt chỗ (lấy tên của user_id đang chat với bot)
+        sessionId (str): Mã phiên sạc cần kết thúc (bắt buộc)
+        kWh (float): Số kWh đã sạc trong phiên (bắt buộc)
+        bạn phải gắn chuỗi jwt hợp lệ vào tham số jwt để xác thực người dùng khi gọi API (lấy từ context của cuộc hội thoại, bắt buộc)
+
+    Returns:
+        str: Kết thúc phiên sạc thành công hoặc thất bại (xin lỗi vì bất tiện này khi thất bại)
+    
+    Examples:
+        User: "Tôi muốn kết thúc phiên sạc"
+        >>> finish_charging_session("email@gmail.com", "session_123", float("10.5"), "jwt_token")
+        "✅ Kết thúc phiên sạc thành công! anh/chị có thể thanh toán rồi ạ...!"
+
+        User: "Kết thúc phiên sạc không thành công"
+        >>> finish_charging_session("email@gmail.com", "session_123", float("10.5"), "jwt_token")
+        "❌ Kết thúc phiên sạc không thành công! xin lỗi anh/chị vì sự bất tiện này...!"
+    """
+    # ✅ CRITICAL FIX: BỎ try/catch để HTTPException thoát ra ngoài
+    print("=" * 80)
+    print(f"🔧 TOOL CALLED: finish_charging_session")
+    print(f"📝 Parameters: user={user}, sessionId={sessionId}, kWh={kWh}")
+    
+    # Gọi API function (không wrap try/catch)
+    print(f"🆔 Retrieved JWT for user {user}")
+    print(f"🔑 Using JWT: {jwt}")
+    result = await finish_charging_session(
+        user=user,
+        sessionId=sessionId,
+        kWh=kWh,
+        jwt=jwt
+    )
+    
+    print(f"📦 API Response: {result[:200] if result else 'EMPTY'}")
+    print("=" * 80)
+    
+    return result
+# =================== AVAILABLE POST AND STATION ====================
+# =================== AVAILABLE STATIONS AND POSTS TOOL ====================
+@tool
+async def view_available_stations(user: str, jwt: str) -> str:
+    """
+    Xem danh sách các trạm sạc và cột sạc khả dụng để đặt chỗ.
+    
+    🎯 SỬ DỤNG TOOL NÀY KHI:
+    - User muốn "gợi ý trạm có chỗ trống"
+    - User hỏi "trạm nào đang trống?"
+    - User nói "cho tôi xem các trạm sạc"
+    - User muốn đặt chỗ nhưng chưa biết trạm nào
+    
+    ⚠️ QUAN TRỌNG - ĐỌC KỸ:
+    Tool này trả về JSON với cấu trúc:
+    [
+        {
+            "station_id": "STA001",
+            "station_name": "Trạm A1", 
+            "address": "123 Test Street",
+            "number_of_posts": 3,
+            "available_posts": ["POST001", "POST003"],  # ← Danh sách trụ TRỐNG
+            "total_available": 2
+        },
+        ...
+    ]
+    
+    📋 SAU KHI NHẬN KẾT QUẢ, AGENT PHẢI:
+    
+    1️⃣ PHÂN TÍCH available_posts:
+       • Nếu available_posts = [] (rỗng) → Trạm KHÔNG CÒN CHỖ
+       • Nếu available_posts = ["POST001", ...] → Trạm CÒN CHỖ
+    
+    2️⃣ HIỂN THỊ CHO USER:
+       
+       ✅ NẾU CÓ TRẠM CÓ CHỖ:
+       "Dạ, đây là các trạm sạc đang có chỗ trống ạ:
+       
+       1. 🏢 Trạm A1 (ID: STA001)
+          📍 Địa chỉ: 123 Test Street
+          🔌 Số cột sạc: 3
+          ✅ Cột khả dụng: 2 cột (POST001, POST003)
+       
+       2. 🏢 Trạm A2 (ID: STA002)
+          📍 Địa chỉ: 531 Trường Chinh
+          🔌 Số cột sạc: 4
+          ✅ Cột khả dụng: 2 cột (POST005, POST004)
+       
+       Anh/chị muốn chọn trạm nào ạ? (Trả lời số thứ tự hoặc tên trạm)"
+       
+       ❌ NẾU TẤT CẢ TRẠM ĐỀU KHÔNG CÒN CHỖ:
+       "⚠️ Dạ, hiện tại tất cả các trạm sạc đều đã kín chỗ ạ.
+       
+       📋 Các trạm hiện có:
+       1. 🏢 Trạm A1 - ❌ Không còn chỗ trống
+       2. 🏢 Trạm A2 - ❌ Không còn chỗ trống
+       
+       Anh/chị có thể:
+       1️⃣ Vào hàng chờ tại trạm bất kỳ
+       2️⃣ Chờ em kiểm tra lại sau vài phút
+       3️⃣ Liên hệ tổng đài: 1900-xxxx
+       
+       Anh/chị muốn chọn phương án nào ạ?"
+    
+    3️⃣ KHI USER CHỌN TRẠM:
+       • Lấy station_id và available_posts
+       • TỰ ĐỘNG chọn trụ đầu tiên: post_id = available_posts[0]
+       • KHÔNG HỎI user chọn trụ nào
+       • KHÔNG GỌI thêm API get_available_post_auto()
+       
+       Thông báo:
+       "✅ Dạ, em đã tự động chọn trụ [post_id] cho anh/chị ạ.
+       Tiếp tục sang bước chọn xe ạ."
+    
+    4️⃣ NẾU USER NÓI TÊN TRẠM CỤ THỂ:
+       Ví dụ: "Tôi muốn đặt Trạm A1"
+       
+       → Tìm trạm có station_name = "Trạm A1" trong kết quả
+       
+       • NẾU TÌM THẤY VÀ available_posts.length > 0:
+         "✅ Dạ, Trạm A1 đang có [X] trụ trống.
+         Em đã tự động chọn trụ [post_id] cho anh/chị ạ."
+       
+       • NẾU TÌM THẤY NHƯNG available_posts = []:
+         "⚠️ Dạ, Trạm A1 hiện không còn chỗ trống ạ.
+         Anh/chị muốn vào hàng chờ hay chọn trạm khác ạ?"
+       
+       • NẾU KHÔNG TÌM THẤY:
+         "❌ Dạ, em không tìm thấy trạm [tên] trong hệ thống ạ.
+         Anh/chị có thể kiểm tra lại tên trạm không ạ?"
+    
+    Args:
+        user (str): Email người dùng (tự động lấy từ user_id trong state)
+        jwt (str): Token xác thực (tự động inject từ context hội thoại)
+    
+    Returns:
+        str: JSON string chứa danh sách trạm và trụ khả dụng
+        
+    Example Response:
+        Trường hợp có trạm trống:
+        >>> view_available_stations("user@email.com", "jwt_token")
+        '''
+        📍 Tìm thấy 2 trạm sạc khả dụng:
+        
+        1. 🏢 Trạm A1 (ID: STA001)
+           📍 Địa chỉ: 123 Test Street
+           🔌 Số cột sạc: 3 cột
+           ✅ Cột khả dụng: 2 cột (POST001, POST003)
+           📅 Thành lập: 2025-10-23T21:50:26.540258
+           🟢 Trạng thái: Đang hoạt động
+        
+        2. 🏢 Trạm A2 (ID: STA002)
+           📍 Địa chỉ: 531 Trường Chinh
+           🔌 Số cột sạc: 4 cột
+           ✅ Cột khả dụng: 2 cột (POST005, POST004)
+           📅 Thành lập: 2025-10-23T21:50:26.576015
+           🟢 Trạng thái: Đang hoạt động
+        '''
+        
+        Trường hợp không có trạm trống:
+        >>> view_available_stations("user@email.com", "jwt_token")
+        '''
+        ⚠️ Hiện tại không có trạm sạc nào có chỗ trống.
+        
+        📋 Các trạm hiện có (tất cả đã kín):
+        1. 🏢 Trạm A1 - ❌ 0/3 trụ trống
+        2. 🏢 Trạm A2 - ❌ 0/4 trụ trống
+        '''
+    
+    Raises:
+        HTTPException: 
+            - 401: Không có JWT hoặc JWT không hợp lệ
+            - 403: User không có quyền truy cập
+            - 500: Lỗi server backend
+            - 503: Không kết nối được backend
+            - 504: Backend timeout
+    
+    🔒 Bảo mật:
+        Tool tự động sử dụng JWT từ context để xác thực với backend.
+        Không bao giờ tự tạo hoặc giả mạo JWT.
+    
+    💡 WORKFLOW HOÀN CHỈNH:
+        
+        User: "Tôi muốn đặt chỗ sạc xe"
+        
+        Agent: "Dạ, anh/chị muốn:
+                1️⃣ Đặt chỗ tại trạm cụ thể
+                2️⃣ Để em gợi ý trạm có chỗ trống"
+        
+        User: "Gợi ý cho tôi"
+        
+        Agent: [GỌI view_available_stations()]
+        
+        [NHẬN KẾT QUẢ]
+        
+        Agent: [PHÂN TÍCH available_posts của từng trạm]
+               [HIỂN THỊ danh sách trạm CÓ CHỖ TRỐNG]
+               [HỎI user chọn trạm]
+        
+        User: "Chọn trạm số 1"
+        
+        Agent: [LẤY station_id và available_posts[0]]
+               [TỰ ĐỘNG chọn trụ - KHÔNG HỎI user]
+               "✅ Em đã chọn trụ POST001 cho anh/chị ạ."
+               [CHUYỂN sang bước chọn xe]
+    
+    ⚠️ LƯU Ý TUYỆT ĐỐI:
+        - KHÔNG bao giờ hỏi user "Anh/chị chọn trụ nào?"
+        - LUÔN LUÔN tự động chọn trụ đầu tiên trong available_posts
+        - CHỈ hiển thị thông tin trụ đã chọn, không liệt kê tất cả trụ
+        - NẾU available_posts rỗng → Thông báo không còn chỗ + gợi ý hàng chờ
+    """
+    print("=" * 80)
+    print(f"🔧 TOOL CALLED: view_available_stations")
+    print(f"📝 Parameters:")
+    print(f"   • User: {user}")
+    print(f"   • JWT prefix: {jwt[:20] if jwt else 'MISSING'}...")
+    
+    # ✅ Validate JWT
+    if not jwt:
+        error_msg = "❌ Thiếu token xác thực. Vui lòng đăng nhập lại."
+        print(f"⚠️  {error_msg}")
+        raise HTTPException(status_code=401, detail=error_msg)
+    
+    # ✅ Call API (không wrap try/catch để HTTPException propagate)
+    print(f"🌐 Calling backend API to get available stations...")
+    
+    result = await view_available_stations_and_post(
+        user=user,
+        jwt=jwt
+    )
+    
+    print(f"📦 API Response: {result[:300] if isinstance(result, str) else str(result)[:300]}...")
+    print("=" * 80)
+    
+    return result
+    
 # ==================== UTILITY TOOLS ====================
 
 @tool
@@ -119,39 +451,6 @@ def calculate(expression: str) -> str:
     except Exception as e:
         return f"❌ Lỗi tính toán: {str(e)}"
 
-@tool
-def get_weather(city: str) -> str:
-    """
-    Lấy thông tin thời tiết cho một thành phố (dữ liệu mô phỏng).
-    
-    Sử dụng khi user hỏi về thời tiết:
-    - "thời tiết hôm nay"
-    - "thời tiết ở Hà Nội"
-    
-    Args:
-        city: Tên thành phố
-    
-    Returns:
-        Thông tin thời tiết
-    """
-    import random
-    weathers = [
-        ("Nắng ☀️", "Trời quang đãng, ít mây"),
-        ("Mây ☁️", "Nhiều mây, không mưa"),
-        ("Mưa 🌧️", "Có mưa rào và dông"),
-        ("Gió 💨", "Gió nhẹ đến trung bình")
-    ]
-    weather, desc = random.choice(weathers)
-    temp = random.randint(22, 35)
-    humidity = random.randint(60, 90)
-    
-    return f"""🌤️ Thời tiết tại {city}:
-━━━━━━━━━━━━━━━━━━━━
-• Trạng thái: {weather}
-• Mô tả: {desc}
-• Nhiệt độ: {temp}°C
-• Độ ẩm: {humidity}%
-━━━━━━━━━━━━━━━━━━━━"""
 
 
 @tool
@@ -181,11 +480,12 @@ def search_info(query: str) -> str:
 TOOLS: List = [
     # API Tools (Primary - Ưu tiên cao nhất)
     create_booking,  # Tạo booking trụ sạc
+    finish_charging,  # Kết thúc phiên sạc
+    view_list_car_of_user,  # Xem danh sách xe của user
+    view_available_stations,  # Xem trạm và trụ sạc khả dụng
     # Utility Tools (Secondary - Thứ yếu)
     get_current_time,  # Thời gian
     calculate,         # Tính toán
-    get_random_number, # Random
-    get_weather,       # Thời tiết
     search_info        # Tìm kiếm
 ]
 

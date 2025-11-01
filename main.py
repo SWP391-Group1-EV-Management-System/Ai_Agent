@@ -503,7 +503,7 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
     """
     try:
         # Tải lịch sử chat
-        history = await load_conversation_history(user_id)
+        history = await load_conversation_history(user_id, 100)
         
         # chuyển sang định dạng mà agent hiểu được
         messages = []
@@ -531,7 +531,7 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
             agent_executor.ainvoke(
                 {
                     "messages": messages,
-                    "user_id": user_id,
+                    "user_id": user_id,    
                     "thread_id": thread_id, # thread_id này để agent đọc lại context hội thoại
                     "jwt": jwt
                 },
