@@ -15,6 +15,7 @@ import logging
 import sys
 import signal
 import httpx
+from sse_starlette.sse import EventSourceResponse
 from typing import Dict, Any, List, Optional, Annotated
 from datetime import datetime
 from hashlib import md5
@@ -630,7 +631,6 @@ async def handle_message(
     finally:
         await release_lock(redis, lock_key) # giải phóng khóa trong redis dù thành công hay thất bại
         await clear_checkpoint(user_id) # xóa checkpoint để tránh reuse context cũ
-
 # ==================== CONSUMER ====================
 async def consume_shard(
     redis: aioredis.Redis,
@@ -882,18 +882,239 @@ async def send_message(request: Request): # nhận toàn bộ request từ clien
         logger.error(f"❌ API error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/result/{job_id}")
-async def get_result(job_id: str):
-    redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
-    status = await redis.get(f"job:{job_id}:status")
-    result = await redis.get(f"job:{job_id}:result")
-    await redis.aclose()
-
-    if status == "ok":
-        return {"status": "ok", "result": result}
-    else:
-        raise HTTPException(status_code=403, detail="authentication failed")
-
+@app.get("/stream/{job_id}")
+async def stream_result(job_id: str, request: Request):
+    """
+    SSE endpoint - Stream kết quả real-time từ AI worker
+    Client sẽ nhận events liên tục cho đến khi job hoàn thành
+    """
+    try:
+        # ✅ 1. Xác thực JWT
+        cookie_jar = request.cookies
+        jwt_token = cookie_jar.get("jwt")
+        
+        if not jwt_token:
+            raise HTTPException(status_code=401, detail="Missing authentication token")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                config.SPRING_CHECK_TOKEN_URL,
+                cookies={"jwt": jwt_token}
+            )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+        user_email = response.text.strip()
+        logger.info(f"📡 SSE stream started for job {job_id} (user: {user_email})")
+        
+        # ✅ 2. Generator function để stream events
+        async def event_generator():
+            redis = await aioredis.from_url(config.REDIS_URL, decode_responses=True)
+            
+            try:
+                max_attempts = 120  # Tối đa 2 phút (120 giây)
+                attempt = 0
+                
+                while attempt < max_attempts:
+                    # ✅ Kiểm tra client còn kết nối không
+                    if await request.is_disconnected():
+                        logger.info(f"🔌 Client disconnected for job {job_id}")
+                        break
+                    
+                    # ✅ Kiểm tra job đã hoàn thành chưa
+                    is_completed = await redis.sismember("jobs:completed", job_id)
+                    
+                    if is_completed:
+                        # Job đã xong - Lấy kết quả
+                        result = await redis.get(f"job:{job_id}:result")
+                        
+                        if not result:
+                            # Fallback: Lấy từ database nếu Redis không có
+                            async with AsyncSessionLocal() as session:
+                                db_result = await session.execute(
+                                    text("""
+                                        SELECT content, created_at
+                                        FROM chat_messages 
+                                        WHERE user_id = :user_id 
+                                        AND role = 'assistant'
+                                        ORDER BY created_at DESC 
+                                        LIMIT 1
+                                    """),
+                                    {"user_id": user_email}
+                                )
+                                row = db_result.fetchone()
+                                result = row[0] if row else "Lỗi: Không tìm thấy kết quả"
+                        
+                        # ✅ GỬI KẾT QUẢ CUỐI CÙNG
+                        logger.info(f"✅ Sending final result for job {job_id}")
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "status": "completed",
+                                "job_id": job_id,
+                                "result": result,
+                                "timestamp": datetime.now(timezone.utc).isoformat()
+                            }, ensure_ascii=False)
+                        }
+                        
+                        # Gửi event đóng kết nối
+                        yield {
+                            "event": "done",
+                            "data": json.dumps({"status": "stream_ended"})
+                        }
+                        break
+                    
+                    # ✅ GỬI HEARTBEAT mỗi 3 giây để giữ kết nối
+                    if attempt % 3 == 0:
+                        logger.debug(f"💓 Heartbeat for job {job_id} (attempt {attempt})")
+                        yield {
+                            "event": "heartbeat",
+                            "data": json.dumps({
+                                "status": "processing",
+                                "job_id": job_id,
+                                "attempt": attempt,
+                                "message": "Đang xử lý yêu cầu của bạn..."
+                            })
+                        }
+                    
+                    attempt += 1
+                    await asyncio.sleep(1)  # Poll mỗi giây
+                
+                # ✅ TIMEOUT nếu quá lâu
+                if attempt >= max_attempts:
+                    logger.warning(f"⏱️ Job {job_id} timeout after {max_attempts}s")
+                    yield {
+                        "event": "error",
+                        "data": json.dumps({
+                            "status": "timeout",
+                            "job_id": job_id,
+                            "message": "Yêu cầu xử lý quá lâu. Vui lòng thử lại sau."
+                        })
+                    }
+            
+            except Exception as e:
+                logger.error(f"❌ SSE generator error for job {job_id}: {e}", exc_info=True)
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "status": "error",
+                        "message": str(e)
+                    })
+                }
+            
+            finally:
+                await redis.aclose()
+                logger.info(f"🔚 SSE stream ended for job {job_id}")
+        
+        # ✅ Trả về SSE response
+        return EventSourceResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"  # Tắt buffering cho nginx
+            }
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ SSE endpoint error for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+@app.post("/update_location")
+async def update_location(request: Request):
+    """
+    Cập nhật vị trí GPS của user (latitude, longitude)
+    Frontend gọi API này mỗi khi user di chuyển >= 500m
+    
+    Request body:
+    {
+        "latitude": 10.762622,
+        "longitude": 106.660172
+    }
+    """
+    try:
+        # ✅ 1. Xác thực JWT
+        cookie_jar = request.cookies
+        jwt_token = cookie_jar.get("jwt")
+        
+        if not jwt_token:
+            raise HTTPException(status_code=401, detail="Missing authentication token")
+        
+        # Verify token với Spring backend
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                config.SPRING_CHECK_TOKEN_URL,
+                cookies={"jwt": jwt_token}
+            )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+        user_email = response.text.strip()
+        
+        # ✅ 2. Parse và validate coordinates
+        data = await request.json()
+        latitude = data.get("latitude")
+        longitude = data.get("longitude")
+        print("✅✅✅Latitude:", latitude, "✅✅✅Longitude:", longitude)
+        if latitude is None or longitude is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required fields: latitude, longitude"
+            )
+        
+        try:
+            lat = float(latitude)
+            lon = float(longitude)
+            
+            if not (-90 <= lat <= 90):
+                raise ValueError("Latitude must be between -90 and 90")
+            if not (-180 <= lon <= 180):
+                raise ValueError("Longitude must be between -180 and 180")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid coordinates: {str(e)}")
+        
+        # ✅ 3. Lưu vào Redis
+        redis = await aioredis.from_url(config.REDIS_URL, decode_responses=True)
+        
+        try:
+            location_key = f"location:{user_email}"
+            location_data = {
+                "latitude": lat,
+                "longitude": lon,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Lưu với TTL 24 giờ
+            await redis.setex(
+                location_key,
+                86400,  # 24 hours
+                json.dumps(location_data)
+            )
+            
+            logger.info(f"📍 Updated location for {user_email}: ({lat}, {lon})")
+            
+            return JSONResponse({
+                "status": "success",
+                "message": "Location updated successfully",
+                "data": {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "timestamp": location_data["updated_at"]
+                }
+            })
+        
+        finally:
+            await redis.aclose()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Update location error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__": # chỉ chạy được khi run file này trực tiếp, không chạy được khi import
     try:

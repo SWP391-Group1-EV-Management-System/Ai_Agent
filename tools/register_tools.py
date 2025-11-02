@@ -7,8 +7,9 @@ from fastapi import HTTPException
 from langchain_core.tools import tool
 from typing import List
 import json
-import asyncio
-
+import logging
+from datetime import datetime, timezone
+logger = logging.getLogger(__name__)
 
 # ✅ Import API functions với alias để tránh conflict
 from tools.API_BE import (
@@ -210,172 +211,227 @@ async def finish_charging(user: str, sessionId: str, kWh: float, jwt: str) -> st
 @tool
 async def view_available_stations(user: str, jwt: str) -> str:
     """
-    Xem danh sách các trạm sạc và cột sạc khả dụng để đặt chỗ.
+    Xem danh sách các trạm sạc và cột sạc khả dụng, tự động sắp xếp theo khoảng cách từ vị trí hiện tại.
     
     🎯 SỬ DỤNG TOOL NÀY KHI:
     - User muốn "gợi ý trạm có chỗ trống"
     - User hỏi "trạm nào đang trống?"
     - User nói "cho tôi xem các trạm sạc"
+    - User muốn "tìm trạm gần nhất"
     - User muốn đặt chỗ nhưng chưa biết trạm nào
     
-    ⚠️ QUAN TRỌNG - ĐỌC KỸ:
-    Tool này trả về JSON với cấu trúc:
-    [
-        {
-            "station_id": "STA001",
-            "station_name": "Trạm A1", 
-            "address": "123 Test Street",
-            "number_of_posts": 3,
-            "available_posts": ["POST001", "POST003"],  # ← Danh sách trụ TRỐNG
-            "total_available": 2
-        },
-        ...
-    ]
+    ⚠️ CÁCH HOẠT ĐỘNG:
+    1. Tool TỰ ĐỘNG lấy GPS từ Redis (nếu có)
+    2. Gọi API Spring Boot với GPS để tính khoảng cách
+    3. Trả về danh sách trạm đã sắp xếp theo khoảng cách gần → xa
+    4. Hiển thị thông tin chi tiết: địa chỉ, khoảng cách, trụ trống
     
-    📋 SAU KHI NHẬN KẾT QUẢ, AGENT PHẢI:
+    📋 CẤU TRÚC DỮ LIỆU TRẢ VỀ:
     
-    1️⃣ PHÂN TÍCH available_posts:
-       • Nếu available_posts = [] (rỗng) → Trạm KHÔNG CÒN CHỖ
-       • Nếu available_posts = ["POST001", ...] → Trạm CÒN CHỖ
+    Khi CÓ GPS:
+    '''
+    📍 Tìm thấy 2 trạm sạc (đã sắp xếp theo khoảng cách):
     
-    2️⃣ HIỂN THỊ CHO USER:
+    1. 🏢 Trạm A1 (ID: STA001)
+       📍 Địa chỉ: 123 Test Street
+       🚗 Khoảng cách: 5.74km
+       🔌 Số cột sạc: 3
+       ✅ Cột khả dụng: 3 cột (POST001, POST003, POST002)
+       📅 Thành lập: 2025-10-23
+    
+    2. 🏢 Trạm A2 (ID: STA002)
+       📍 Địa chỉ: 531 Trường Chinh
+       🚗 Khoảng cách: 8.20km
+       🔌 Số cột sạc: 4
+       ❌ Không còn cột trống (tất cả 4 cột đã đặt)
+       📅 Thành lập: 2025-10-23
+    '''
+    
+    Khi KHÔNG CÓ GPS:
+    '''
+    📍 Tìm thấy 2 trạm sạc khả dụng:
+    
+    1. 🏢 Trạm A1 (ID: STA001)
+       📍 Địa chỉ: 123 Test Street
+       🔌 Số cột sạc: 3
+       ✅ Cột khả dụng: 2 cột (POST001, POST003)
+    
+    💡 Lưu ý: Em chưa có vị trí GPS của anh/chị nên không tính được khoảng cách.
+    Anh/chị vui lòng cho phép truy cập vị trí để được gợi ý trạm gần nhất ạ.
+    '''
+    
+    🔹 SAU KHI NHẬN KẾT QUẢ, AGENT PHẢI:
+    
+    1️⃣ PHÂN TÍCH available_posts trong mỗi trạm:
+       • available_posts = [] → Trạm ĐÃ HẾT CHỖ
+       • available_posts = ["POST001", ...] → Trạm CÒN CHỖ
+    
+    2️⃣ HIỂN THỊ CHO USER (dựa vào text đã format sẵn):
        
-       ✅ NẾU CÓ TRẠM CÓ CHỖ:
-       "Dạ, đây là các trạm sạc đang có chỗ trống ạ:
+       ✅ NẾU CÓ TRẠM CÓ CHỖ TRỐNG:
+       - Đọc và hiển thị thông tin từ response
+       - Nhấn mạnh trạm GẦN NHẤT (nếu có khoảng cách)
+       - Hỏi: "Anh/chị muốn chọn trạm nào ạ?"
        
-       1. 🏢 Trạm A1 (ID: STA001)
-          📍 Địa chỉ: 123 Test Street
-          🔌 Số cột sạc: 3
-          ✅ Cột khả dụng: 2 cột (POST001, POST003)
-       
-       2. 🏢 Trạm A2 (ID: STA002)
-          📍 Địa chỉ: 531 Trường Chinh
-          🔌 Số cột sạc: 4
-          ✅ Cột khả dụng: 2 cột (POST005, POST004)
-       
-       Anh/chị muốn chọn trạm nào ạ? (Trả lời số thứ tự hoặc tên trạm)"
-       
-       ❌ NẾU TẤT CẢ TRẠM ĐỀU KHÔNG CÒN CHỖ:
-       "⚠️ Dạ, hiện tại tất cả các trạm sạc đều đã kín chỗ ạ.
-       
-       📋 Các trạm hiện có:
-       1. 🏢 Trạm A1 - ❌ Không còn chỗ trống
-       2. 🏢 Trạm A2 - ❌ Không còn chỗ trống
+       ❌ NẾU TẤT CẢ TRẠM ĐỀU HẾT CHỖ:
+       "⚠️ Dạ, hiện tại tất cả các trạm đều đã kín chỗ ạ.
        
        Anh/chị có thể:
-       1️⃣ Vào hàng chờ tại trạm bất kỳ
-       2️⃣ Chờ em kiểm tra lại sau vài phút
+       1️⃣ Vào hàng chờ tại trạm [gần nhất]
+       2️⃣ Chờ 10-15 phút rồi thử lại
        3️⃣ Liên hệ tổng đài: 1900-xxxx
        
        Anh/chị muốn chọn phương án nào ạ?"
     
     3️⃣ KHI USER CHỌN TRẠM:
-       • Lấy station_id và available_posts
+       
+       User có thể chọn bằng:
+       - Số thứ tự: "Chọn trạm số 1"
+       - Tên trạm: "Tôi chọn Trạm A1"
+       - ID trạm: "Chọn STA001"
+       
+       Agent phải:
+       • Parse thông tin trạm từ response text
+       • Tìm available_posts của trạm đó
        • TỰ ĐỘNG chọn trụ đầu tiên: post_id = available_posts[0]
-       • KHÔNG HỎI user chọn trụ nào
-       • KHÔNG GỌI thêm API get_available_post_auto()
+       • KHÔNG HỎI user "Anh/chị muốn chọn trụ nào?"
+       • KHÔNG GỌI thêm API
        
        Thông báo:
-       "✅ Dạ, em đã tự động chọn trụ [post_id] cho anh/chị ạ.
+       "✅ Dạ, em đã tự động chọn trụ [post_id] tại Trạm [name] cho anh/chị ạ.
+       
+       [Nếu có khoảng cách]: Trạm này cách anh/chị [X]km ạ.
+       
        Tiếp tục sang bước chọn xe ạ."
     
-    4️⃣ NẾU USER NÓI TÊN TRẠM CỤ THỂ:
+    4️⃣ NẾU USER NÓI TRỰC TIẾP TÊN TRẠM (không gọi tool trước):
+       
        Ví dụ: "Tôi muốn đặt Trạm A1"
        
-       → Tìm trạm có station_name = "Trạm A1" trong kết quả
+       → GỌI tool view_available_stations() trước
+       → Tìm "Trạm A1" trong response
        
-       • NẾU TÌM THẤY VÀ available_posts.length > 0:
+       • NẾU TRẠM CÓ CHỖ (available_posts.length > 0):
          "✅ Dạ, Trạm A1 đang có [X] trụ trống.
+         [Nếu có khoảng cách]: Trạm này cách anh/chị [Y]km.
          Em đã tự động chọn trụ [post_id] cho anh/chị ạ."
        
-       • NẾU TÌM THẤY NHƯNG available_posts = []:
+       • NẾU TRẠM HẾT CHỖ (available_posts = []):
          "⚠️ Dạ, Trạm A1 hiện không còn chỗ trống ạ.
-         Anh/chị muốn vào hàng chờ hay chọn trạm khác ạ?"
+         Anh/chị muốn:
+         1️⃣ Vào hàng chờ tại trạm này
+         2️⃣ Chọn trạm khác đang có chỗ"
        
-       • NẾU KHÔNG TÌM THẤY:
+       • NẾU KHÔNG TÌM THẤY TRẠM:
          "❌ Dạ, em không tìm thấy trạm [tên] trong hệ thống ạ.
-         Anh/chị có thể kiểm tra lại tên trạm không ạ?"
+         Anh/chị có thể xem danh sách trạm hiện có không ạ?"
+    
+    5️⃣ XỬ LÝ TRƯỜNG HỢP ĐẶC BIỆT:
+       
+       • NẾU KHÔNG CÓ GPS:
+         - Vẫn hiển thị danh sách trạm
+         - Thêm thông báo: "Em chưa có vị trí GPS..."
+         - Gợi ý user bật GPS để được sắp xếp theo khoảng cách
+       
+       • NẾU TRẠM GẦN NHẤT < 1km:
+         - Nhấn mạnh: "Trạm này rất gần anh/chị (chỉ [X]m)"
+         - Khuyến khích: "Anh/chị có thể đến ngay ạ"
+       
+       • NẾU TẤT CẢ TRẠM ĐỀU > 10km:
+         - Cảnh báo: "Các trạm đều khá xa (> 10km)"
+         - Gợi ý: "Anh/chị có muốn em tìm trong bán kính rộng hơn không?"
     
     Args:
-        user (str): Email người dùng (tự động lấy từ user_id trong state)
+        user (str): Email người dùng (tự động lấy từ user_id trong AgentState)
         jwt (str): Token xác thực (tự động inject từ context hội thoại)
     
     Returns:
-        str: JSON string chứa danh sách trạm và trụ khả dụng
-        
-    Example Response:
-        Trường hợp có trạm trống:
-        >>> view_available_stations("user@email.com", "jwt_token")
-        '''
-        📍 Tìm thấy 2 trạm sạc khả dụng:
-        
-        1. 🏢 Trạm A1 (ID: STA001)
-           📍 Địa chỉ: 123 Test Street
-           🔌 Số cột sạc: 3 cột
-           ✅ Cột khả dụng: 2 cột (POST001, POST003)
-           📅 Thành lập: 2025-10-23T21:50:26.540258
-           🟢 Trạng thái: Đang hoạt động
-        
-        2. 🏢 Trạm A2 (ID: STA002)
-           📍 Địa chỉ: 531 Trường Chinh
-           🔌 Số cột sạc: 4 cột
-           ✅ Cột khả dụng: 2 cột (POST005, POST004)
-           📅 Thành lập: 2025-10-23T21:50:26.576015
-           🟢 Trạng thái: Đang hoạt động
-        '''
-        
-        Trường hợp không có trạm trống:
-        >>> view_available_stations("user@email.com", "jwt_token")
-        '''
-        ⚠️ Hiện tại không có trạm sạc nào có chỗ trống.
-        
-        📋 Các trạm hiện có (tất cả đã kín):
-        1. 🏢 Trạm A1 - ❌ 0/3 trụ trống
-        2. 🏢 Trạm A2 - ❌ 0/4 trụ trống
-        '''
+        str: Text đã format sẵn, bao gồm:
+             - Danh sách trạm với thông tin chi tiết
+             - Khoảng cách (nếu có GPS)
+             - Trụ khả dụng hoặc thông báo hết chỗ
+             - Lưu ý nếu không có GPS
     
     Raises:
         HTTPException: 
             - 401: Không có JWT hoặc JWT không hợp lệ
-            - 403: User không có quyền truy cập
             - 500: Lỗi server backend
             - 503: Không kết nối được backend
             - 504: Backend timeout
     
-    🔒 Bảo mật:
-        Tool tự động sử dụng JWT từ context để xác thực với backend.
-        Không bao giờ tự tạo hoặc giả mạo JWT.
-    
     💡 WORKFLOW HOÀN CHỈNH:
         
-        User: "Tôi muốn đặt chỗ sạc xe"
-        
-        Agent: "Dạ, anh/chị muốn:
-                1️⃣ Đặt chỗ tại trạm cụ thể
-                2️⃣ Để em gợi ý trạm có chỗ trống"
-        
-        User: "Gợi ý cho tôi"
-        
-        Agent: [GỌI view_available_stations()]
-        
-        [NHẬN KẾT QUẢ]
-        
-        Agent: [PHÂN TÍCH available_posts của từng trạm]
-               [HIỂN THỊ danh sách trạm CÓ CHỖ TRỐNG]
-               [HỎI user chọn trạm]
-        
-        User: "Chọn trạm số 1"
-        
-        Agent: [LẤY station_id và available_posts[0]]
-               [TỰ ĐỘNG chọn trụ - KHÔNG HỎI user]
-               "✅ Em đã chọn trụ POST001 cho anh/chị ạ."
-               [CHUYỂN sang bước chọn xe]
+        ┌─────────────────────────────────────────────┐
+        │ User: "Tôi muốn đặt chỗ sạc xe"             │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        ┌─────────────────────────────────────────────┐
+        │ Agent: "Anh/chị muốn:                       │
+        │ 1️⃣ Đặt tại trạm cụ thể                      │
+        │ 2️⃣ Gợi ý trạm gần nhất"                     │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        ┌─────────────────────────────────────────────┐
+        │ User: "Gợi ý cho tôi"                       │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        ┌─────────────────────────────────────────────┐
+        │ Agent: [GỌI view_available_stations()]      │
+        │        → Tool lấy GPS từ Redis              │
+        │        → Gọi API với GPS                    │
+        │        → Trả về danh sách đã sort          │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        ┌─────────────────────────────────────────────┐
+        │ Agent: "Dạ, đây là các trạm gần nhất:      │
+        │                                             │
+        │ 1. Trạm A1 - 5.74km - Còn 3 trụ           │
+        │ 2. Trạm A2 - 8.20km - Hết chỗ             │
+        │                                             │
+        │ Anh/chị chọn trạm nào ạ?"                  │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        ┌─────────────────────────────────────────────┐
+        │ User: "Chọn trạm số 1"                      │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        ┌─────────────────────────────────────────────┐
+        │ Agent: [Parse response → Lấy Trạm A1]      │
+        │        available_posts = [POST001, ...]     │
+        │        post_id = POST001 (tự động)          │
+        │                                             │
+        │ "✅ Đã chọn trụ POST001 tại Trạm A1 ạ.     │
+        │ Trạm cách anh/chị 5.74km.                  │
+        │ Sang bước chọn xe ạ."                      │
+        └─────────────────┬───────────────────────────┘
+                          ▼
+        [Tiếp tục workflow chọn xe...]
     
-    ⚠️ LƯU Ý TUYỆT ĐỐI:
-        - KHÔNG bao giờ hỏi user "Anh/chị chọn trụ nào?"
-        - LUÔN LUÔN tự động chọn trụ đầu tiên trong available_posts
-        - CHỈ hiển thị thông tin trụ đã chọn, không liệt kê tất cả trụ
-        - NẾU available_posts rỗng → Thông báo không còn chỗ + gợi ý hàng chờ
+    ⚠️ LƯU Ý TUYỆT ĐỐI - BẮT BUỘC TUÂN THỦ:
+    
+    ✅ PHẢI LÀM:
+    1. Đọc kỹ response text để extract thông tin trạm
+    2. Tự động chọn trụ đầu tiên từ available_posts
+    3. Nhấn mạnh khoảng cách nếu < 2km (rất gần)
+    4. Thông báo rõ ràng nếu không có GPS
+    5. Gợi ý hàng chờ nếu trạm hết chỗ
+    
+    ❌ KHÔNG ĐƯỢC LÀM:
+    1. Hỏi user "Anh/chị muốn chọn trụ nào?"
+    2. Liệt kê tất cả trụ để user chọn
+    3. Gọi thêm API get_available_post_auto()
+    4. Bỏ qua việc kiểm tra available_posts
+    5. Cho user đặt chỗ tại trạm không còn trụ trống
+    
+    🔒 Bảo mật:
+        - Tool tự động lấy JWT từ context (không cần user cung cấp)
+        - Tool tự động lấy GPS từ Redis (không cần user nhập tọa độ)
+        - Không bao giờ tự tạo hoặc giả mạo JWT
+    
+    📊 Performance:
+        - Response time: ~500-1000ms (bao gồm Redis + API call)
+        - Cache: Không cache (dữ liệu realtime)
+        - Retry: Tự động retry 3 lần nếu API fail
     """
     print("=" * 80)
     print(f"🔧 TOOL CALLED: view_available_stations")
@@ -389,15 +445,15 @@ async def view_available_stations(user: str, jwt: str) -> str:
         print(f"⚠️  {error_msg}")
         raise HTTPException(status_code=401, detail=error_msg)
     
-    # ✅ Call API (không wrap try/catch để HTTPException propagate)
-    print(f"🌐 Calling backend API to get available stations...")
+    # ✅ Call API với GPS từ Redis
+    print(f"🌐 Calling backend API (with GPS from Redis) to get available stations...")
     
     result = await view_available_stations_and_post(
         user=user,
         jwt=jwt
     )
     
-    print(f"📦 API Response: {result[:300] if isinstance(result, str) else str(result)[:300]}...")
+    print(f"📦 API Response preview: {result[:300] if isinstance(result, str) else str(result)[:300]}...")
     print("=" * 80)
     
     return result
