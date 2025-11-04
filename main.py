@@ -184,11 +184,12 @@ llm_sem = asyncio.Semaphore(config.LLM_CONCURRENCY) # cho phép số lượng LL
 from operator import add
 
 class AgentState(TypedDict):
-    """Agent state for LangGraph 1.0.0 with message reducer"""
-    messages: Annotated[List[BaseMessage], add]  # ✅ Use 'add' operator to APPEND messages
+    """Agent state with job_id and redis"""
+    messages: Annotated[List[BaseMessage], add]
     user_id: str
     thread_id: str
-    jwt: str  # thêm jwt vào state cần thiết
+    jwt: str
+    job_id: str # thêm job_id để trả thêm action cho UI
 
 # ==================== AGENT NODES ====================
 async def call_model(state: AgentState): #state ở đây là dict giống như Map trong java
@@ -196,12 +197,13 @@ async def call_model(state: AgentState): #state ở đây là dict giống như 
     messages = state["messages"]
     user_id = state.get("user_id", "unknown")
     jwt = state.get("jwt", None)  # ✅ Lấy JWT từ state
-    
+    job_id = state.get("job_id", None)  # ✅ Lấy job_id từ state    
     # ✅ Thêm JWT vào system prompt để LLM biết
     system_content = config.SYSTEM_PROMPT
     if jwt:
         system_content += f"\n\n🔐 **Authentication Context:**\nUser JWT Token (use this for API calls): `{jwt}`"
-    
+    if job_id:
+        system_content += f"\n\n🔑 **Job Context:**\nUser Job ID (use this for tracking): `{job_id}`"
     system_msg = SystemMessage(content=system_content)
     
     # Remove any existing system messages to avoid duplicates
@@ -289,10 +291,12 @@ async def create_agent_executor():
         messages = state['messages']
         user_id = state.get('user_id')
         jwt = state.get('jwt')
+        job_id = state.get('job_id')
         
         print(f"📊 Context available:")
         print(f"   - user_id: {user_id}")
         print(f"   - jwt: {jwt[:20] if jwt else 'None'}...")
+        print(f"   - job_id: {job_id}")
         
         # Lấy last message (AIMessage with tool_calls)
         last_message = messages[-1]
@@ -317,6 +321,8 @@ async def create_agent_executor():
                 if user_id:
                     tool_args['user'] = user_id
                     print(f"   ✅ Injected user_id: {user_id}")
+                #if job_id:
+                #    tool_args['job_id'] = job_id 
                 else:
                     print(f"   ⚠️ No user_id in state!")
             
@@ -497,7 +503,7 @@ async def get_user_jwt(user_email: str, redis):
     print(f"⚠️ No JWT found for user email: {user_email}")
     return None
 # ==================== AGENT EXECUTION ====================
-async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> str:
+async def invoke_agent(user_id: str, user_input: str, job_id: str, redis: aioredis.Redis) -> str:
     """
     Gọi agent cùng với checkpointer, memory lịch sử chat, Phiên làm việc của 1 worker gồm nhiều node 
     (LangGraph 1.0.0)
@@ -534,7 +540,8 @@ async def invoke_agent(user_id: str, user_input: str, redis: aioredis.Redis) -> 
                     "messages": messages,
                     "user_id": user_id,    
                     "thread_id": thread_id, # thread_id này để agent đọc lại context hội thoại
-                    "jwt": jwt
+                    "jwt": jwt,
+                    "job_id": job_id # truyền job_id để LLM biết
                 },
                 config=config_dict # cấu hình thread_id để cho các node trong agent dùng chung, giữ context xuyên suốt workflow, để tránh ghi đè thread_id nếu có nhiều người dùng cùng hội thoại một lúc
                 # quản lý runtime, workflow là chính 
@@ -590,7 +597,7 @@ async def handle_message(
         logger.info(f"🔄 Processing job {job_id} for user {user_id}")
         
         # Gọi agent
-        reply = await invoke_agent(user_id, user_message, redis)
+        reply = await invoke_agent(user_id, user_message, job_id, redis)
 
         # Lưu vào cơ sở dữ liệu
         await save_message(user_id, "user", user_message)
@@ -945,7 +952,15 @@ async def stream_result(job_id: str, request: Request):
                                 )
                                 row = db_result.fetchone()
                                 result = row[0] if row else "Lỗi: Không tìm thấy kết quả"
-                        
+                        # Lấy action nếu có
+                        action = "none"
+                        actionId = "none"
+                        rank = "none"
+                        if(await redis.exists(job_id)):
+                            action = await redis.hget(job_id, "action")
+                            actionId = await redis.hget(job_id, "idAction")
+                            rank = await redis.hget(job_id, "rank")
+                            await redis.delete(job_id) 
                         # ✅ GỬI KẾT QUẢ CUỐI CÙNG
                         logger.info(f"✅ Sending final result for job {job_id}")
                         yield {
@@ -954,7 +969,10 @@ async def stream_result(job_id: str, request: Request):
                                 "status": "completed",
                                 "job_id": job_id,
                                 "result": result,
-                                "timestamp": datetime.now(timezone.utc).isoformat()
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "action": action,
+                                "actionId": actionId,
+                                "rank": rank
                             }, ensure_ascii=False)
                         }
                         
@@ -974,7 +992,8 @@ async def stream_result(job_id: str, request: Request):
                                 "status": "processing",
                                 "job_id": job_id,
                                 "attempt": attempt,
-                                "message": "Đang xử lý yêu cầu của bạn..."
+                                "message": "Đang xử lý yêu cầu của bạn...",
+                                "action": "processing"
                             })
                         }
                     

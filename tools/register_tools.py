@@ -21,7 +21,7 @@ from tools.API_BE import (
 
 # =================== BOOKING TOOLS ====================
 @tool
-async def create_booking(user: str, charging_post: str, car: str, jwt: str) -> str:
+async def create_booking(user: str, charging_post: str, car: str, jwt: str, job_id: str) -> str:
     """
     Tạo booking đặt chỗ cho trụ sạc xe điện
     
@@ -91,7 +91,8 @@ async def create_booking(user: str, charging_post: str, car: str, jwt: str) -> s
         user=user,
         charging_post=charging_post,
         car=car,
-        jwt=jwt
+        jwt=jwt,
+        job_id=job_id
     )
     
     print(f"📦 API Response: {result[:200] if result else 'EMPTY'}")
