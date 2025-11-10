@@ -1133,6 +1133,54 @@ async def update_location(request: Request):
     except Exception as e:
         logger.error(f"❌ Update location error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# ==================== DETECT CHARGING TYPE ENDPOINT ====================
+@app.post("/api/detect-charging-type")
+async def detect_charging_type_endpoint(request: Request):
+    """
+    API endpoint để phát hiện loại sạc xe điện dựa trên tên xe
+    """
+    try:
+        # ✅ Parse request body
+        data = await request.json()
+        car_name = data.get("car_name", "").strip()
+        
+        if not car_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required field: car_name"
+            )
+        
+        if len(car_name) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail="Car name too short. Please provide full name (e.g., 'VinFast VF5')"
+            )
+        
+        logger.info(f"🔍 Detecting charging type for: {car_name}")
+        
+        # ✅ Import function từ API_BE
+        from tools.API_BE import detect_charging_type_by_car_name
+        
+        # ✅ Gọi function detect
+        result = await detect_charging_type_by_car_name(car_name)
+        
+        logger.info(f"✅ Detected: {result['charging_type']} (confidence: {result['confidence']})")
+        
+        return JSONResponse({
+            "status": "success",
+            "data": result
+        })
+    
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        logger.error(f"❌ Detect charging type error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to detect charging type: {str(e)}"
+        )
     
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__": # chỉ chạy được khi run file này trực tiếp, không chạy được khi import

@@ -425,3 +425,156 @@ async def view_available_stations_and_post(user: str, jwt: str) -> str:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
+
+# =================== DETECT CHARGING TYPE BY CAR NAME ====================
+async def detect_charging_type_by_car_name(car_name: str) -> Dict[str, Any]:
+    """
+    Sử dụng Google Gemini AI để tự động phát hiện loại đầu sạc (CCS, CHAdeMo, AC)
+    dựa trên tên xe điện mà người dùng nhập vào.
+    """
+    try:
+        print(f"🔍 Đang phát hiện loại đầu sạc cho xe: {car_name}")
+        
+        # Import Gemini
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        import os
+        
+        # Khởi tạo Gemini với Google Search grounding
+        gemini = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash-exp",
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            temperature=0.1,  # Giảm temperature để có kết quả chính xác hơn
+        )
+        
+        # Tạo prompt chi tiết với yêu cầu kiểm tra xe có tồn tại
+        prompt = f"""
+        Bạn là chuyên gia về xe điện và các tiêu chuẩn sạc.
+
+        Nhiệm vụ: Xác định loại đầu sạc DC (sạc nhanh) của xe điện "{car_name}".
+
+        ⚠️ QUAN TRỌNG - KIỂM TRA TỒN TẠI:
+        1. Trước tiên, kiểm tra xem xe điện "{car_name}" có THỰC SỰ TỒN TẠI không
+        2. Tìm kiếm thông tin chính thức từ nhà sản xuất, website, báo chí uy tín
+        3. Nếu xe KHÔNG TỒN TẠI hoặc KHÔNG TÌM THẤY thông tin đáng tin cậy:
+        → Trả về: "exists": false
+
+        4. Nếu xe TỒN TẠI, xác định loại đầu sạc:
+        - CCS (Combined Charging System): Châu Âu, Mỹ (VinFast, Tesla, BMW, Mercedes...)
+        - CHAdeMo: Nhật Bản (Nissan Leaf, Mitsubishi...)
+        - AC: Sạc chậm (nếu xe chỉ hỗ trợ sạc AC)
+
+        📋 FORMAT JSON:
+
+        Nếu xe KHÔNG tồn tại:
+        {{
+            "exists": false,
+            "reason": "Không tìm thấy thông tin về xe {car_name} từ bất kỳ nguồn đáng tin cậy nào"
+        }}
+
+        Nếu xe TỒN TẠI:
+        {{
+            "exists": true,
+            "charging_type": "CCS" hoặc "CHAdeMo" hoặc "AC",
+            "confidence": "high" hoặc "medium" hoặc "low",
+            "explanation": "Giải thích ngắn gọn về loại sạc của xe này"
+        }}
+
+        🚫 KHÔNG được đoán hoặc giả định về xe không tồn tại!
+        ✅ CHỈ trả về JSON, KHÔNG có text khác.
+        """
+        
+        # Gọi Gemini
+        print(f"🤖 Đang gọi Gemini API...")
+        response = await gemini.ainvoke(prompt)
+        
+        # Parse response
+        response_text = response.content.strip()
+        print(f"📦 Gemini response: {response_text}")
+        
+        # Loại bỏ markdown code blocks nếu có
+        if response_text.startswith("```json"):
+            response_text = response_text.replace("```json", "").replace("```", "").strip()
+        elif response_text.startswith("```"):
+            response_text = response_text.replace("```", "").strip()
+        
+        # Parse JSON
+        try:
+            result = json.loads(response_text)
+            
+            # ✅ KIỂM TRA XE CÓ TỒN TẠI KHÔNG
+            exists = result.get("exists", True)  # Default True để tương thích với response cũ
+            
+            if exists == False or exists == "false":
+                # Xe KHÔNG tồn tại
+                reason = result.get("reason", "Không tìm thấy thông tin về xe này")
+                print(f"❌ Xe không tồn tại: {reason}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Xe '{car_name}' không tồn tại hoặc không tìm thấy thông tin. {reason}"
+                )
+            
+            # Xe TỒN TẠI - Xử lý như bình thường
+            charging_type = result.get("charging_type", "").upper()
+            confidence = result.get("confidence", "low")
+            explanation = result.get("explanation", "")
+            
+            # Validate charging_type
+            valid_types = ["CCS", "CHADEMO", "AC"]
+            if charging_type not in valid_types:
+                # Try to extract from explanation
+                if "CCS" in explanation.upper():
+                    charging_type = "CCS"
+                elif "CHADEMO" in explanation.upper() or "CHAdeMO" in explanation:
+                    charging_type = "CHAdeMo"
+                elif "AC" in explanation.upper():
+                    charging_type = "AC"
+                else:
+                    raise ValueError(f"Invalid charging type: {charging_type}")
+            
+            # Normalize CHAdeMo
+            if charging_type == "CHADEMO":
+                charging_type = "CHAdeMo"
+            
+            return {
+                "car_name": car_name,
+                "charging_type": charging_type,
+                "confidence": confidence,
+                "explanation": explanation
+            }
+            
+        except json.JSONDecodeError as e:
+            print(f"❌ Không thể parse JSON từ Gemini: {e}")
+            print(f"Response text: {response_text}")
+            
+            # Fallback: Tìm kiếm keyword trong response
+            response_upper = response_text.upper()
+            if "CCS" in response_upper:
+                charging_type = "CCS"
+            elif "CHADEMO" in response_upper:
+                charging_type = "CHAdeMo"
+            elif "AC" in response_upper and "DC" not in response_upper:
+                charging_type = "AC"
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Không thể xác định loại đầu sạc từ response của AI"
+                )
+            
+            return {
+                "car_name": car_name,
+                "charging_type": charging_type,
+                "confidence": "low",
+                "explanation": f"Phát hiện từ khóa '{charging_type}' trong response AI"
+            }
+    
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        print(f"❌ Lỗi khi gọi Gemini API: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lỗi hệ thống khi phát hiện loại sạc: {str(e)}"
+        )

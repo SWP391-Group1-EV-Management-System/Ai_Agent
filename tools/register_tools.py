@@ -458,7 +458,6 @@ async def view_available_stations(user: str, jwt: str) -> str:
     print("=" * 80)
     
     return result
-    
 # ==================== UTILITY TOOLS ====================
 
 @tool
@@ -540,6 +539,7 @@ TOOLS: List = [
     finish_charging,  # Kết thúc phiên sạc
     view_list_car_of_user,  # Xem danh sách xe của user
     view_available_stations,  # Xem trạm và trụ sạc khả dụng
+
     # Utility Tools (Secondary - Thứ yếu)
     get_current_time,  # Thời gian
     calculate,         # Tính toán
