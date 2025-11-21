@@ -83,7 +83,7 @@ class Config:
     # Retry & Timeout
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "5"))
     LOCK_TTL_MS: int = int(os.getenv("LOCK_TTL_MS", "30000"))
-    JOB_TIMEOUT_SEC: int = int(os.getenv("JOB_TIMEOUT_SEC", "300"))
+    JOB_TIMEOUT_SEC: int = int(os.getenv("JOB_TIMEOUT_SEC", "9000000"))
     
     # LLM
     USE_DUMMY: bool = os.getenv("USE_DUMMY", "false").lower() == "true"
@@ -204,6 +204,8 @@ async def call_model(state: AgentState): #state ở đây là dict giống như 
         system_content += f"\n\n🔐 **Authentication Context:**\nUser JWT Token (use this for API calls): `{jwt}`"
     if job_id:
         system_content += f"\n\n🔑 **Job Context:**\nUser Job ID (use this for tracking): `{job_id}`"
+    if user_id:
+        system_content += f"\n\n👤 **User Context:**\nUser ID: `{user_id}`"
     system_msg = SystemMessage(content=system_content)
     
     # Remove any existing system messages to avoid duplicates
@@ -503,66 +505,116 @@ async def get_user_jwt(user_email: str, redis):
     print(f"⚠️ No JWT found for user email: {user_email}")
     return None
 # ==================== AGENT EXECUTION ====================
-async def invoke_agent(user_id: str, user_input: str, job_id: str, redis: aioredis.Redis) -> str:
+async def invoke_agent(user_id: str, user_input: str, job_id: str, redis: aioredis.Redis, max_retries: int = 3,
+    retry_delay: int = 2) -> str:
     """
-    Gọi agent cùng với checkpointer, memory lịch sử chat, Phiên làm việc của 1 worker gồm nhiều node 
-    (LangGraph 1.0.0)
+    Gọi agent và retry nếu response rỗng (Gemini quota issue)
     """
-    try:
-        # Tải lịch sử chat
-        history = await load_conversation_history(user_id, 100)
-        
-        # chuyển sang định dạng mà agent hiểu được
-        messages = []
-        for msg in history:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
-        
-        # thêm câu input của người dùng vào luôn 
-        messages.append(HumanMessage(content=user_input))
-        
-        # Thread ID (giữ context hội thoại)
-        thread_id = f"thread_{user_id}"
-        
-        # Configuration for agent
-        config_dict = {
-            "configurable": {
-                "thread_id": thread_id
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🔄 Agent invoke attempt {attempt + 1}/{max_retries} for user {user_id}")
+            
+            # Tải lịch sử chat
+            history = await load_conversation_history(user_id, 100)
+            
+            # chuyển sang định dạng mà agent hiểu được
+            messages = []
+            for msg in history:
+                if msg["role"] == "user":
+                    messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    messages.append(AIMessage(content=msg["content"]))
+            
+            # thêm câu input của người dùng vào luôn 
+            messages.append(HumanMessage(content=user_input))
+            
+            # Thread ID (giữ context hội thoại)
+            thread_id = f"thread_{user_id}"
+            
+            # Configuration for agent
+            config_dict = {
+                "configurable": {
+                    "thread_id": thread_id
+                }
             }
-        }
-        jwt = await get_user_jwt(user_id, redis)  # Lấy JWT từ Redis
-        # gọi agent 
-        result = await asyncio.wait_for(
-            agent_executor.ainvoke(
-                {
-                    "messages": messages,
-                    "user_id": user_id,    
-                    "thread_id": thread_id, # thread_id này để agent đọc lại context hội thoại
-                    "jwt": jwt,
-                    "job_id": job_id # truyền job_id để LLM biết
-                },
-                config=config_dict # cấu hình thread_id để cho các node trong agent dùng chung, giữ context xuyên suốt workflow, để tránh ghi đè thread_id nếu có nhiều người dùng cùng hội thoại một lúc
-                # quản lý runtime, workflow là chính 
-            ),
-            timeout=config.JOB_TIMEOUT_SEC # giới hạn thời gian agent xử lý 
-        )
+            jwt = await get_user_jwt(user_id, redis)
+            
+            # gọi agent 
+            result = await asyncio.wait_for(
+                agent_executor.ainvoke(
+                    {
+                        "messages": messages,
+                        "user_id": user_id,    
+                        "thread_id": thread_id,
+                        "jwt": jwt,
+                        "job_id": job_id
+                    },
+                    config=config_dict
+                ),
+                timeout=config.JOB_TIMEOUT_SEC
+            )
+            
+            # Extract final response
+            final_message = result["messages"][-1]
+            response_text = final_message.content if hasattr(final_message, 'content') else str(final_message)
+            
+            # ✅ KIỂM TRA RESPONSE CÓ RỖNG KHÔNG
+            if not response_text or response_text.strip() == "":
+                logger.warning(f"⚠️ Empty response on attempt {attempt + 1}/{max_retries}")
+                
+                # Log chi tiết từ Gemini
+                if hasattr(final_message, 'usage_metadata'):
+                    output_tokens = final_message.usage_metadata.get('output_tokens', 'unknown')
+                    logger.warning(f"   Output tokens: {output_tokens}")
+                
+                if hasattr(final_message, 'response_metadata'):
+                    block_reason = final_message.response_metadata.get('prompt_feedback', {}).get('block_reason')
+                    finish_reason = final_message.response_metadata.get('finish_reason')
+                    logger.warning(f"   Block reason: {block_reason}, Finish reason: {finish_reason}")
+                
+                # Nếu chưa phải lần cuối → retry với delay
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                    logger.info(f"⏳ Waiting {wait_time}s before retry...")
+                    await asyncio.sleep(wait_time)
+                    continue  # Thử lại
+                else:
+                    # Lần cuối vẫn rỗng → ném lỗi
+                    last_error = "Empty response from Gemini after retries (API quota limit?)"
+                    raise Exception(last_error)
+            
+            # ✅ RESPONSE HỢP LỆ → Trả về
+            logger.info(f"✅ Agent response for user {user_id}: {response_text[:100]}...")
+            return response_text
+            
+        except asyncio.TimeoutError:
+            last_error = f"Agent timeout on attempt {attempt + 1}/{max_retries}"
+            logger.warning(f"⏱️ {last_error}")
+            
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                logger.info(f"⏳ Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise Exception(f"Timeout after {max_retries} retries")
         
-        # Extract final response
-        final_message = result["messages"][-1]
-        response_text = final_message.content if hasattr(final_message, 'content') else str(final_message)
-        
-        logger.info(f"✅ Agent response for user {user_id}: {response_text[:100]}...")
-        return response_text # trả kết quả
-        
-    except asyncio.TimeoutError: # bắt lỗi nếu agent chạy quá thời gian 
-        logger.error(f"⏱️ Agent timeout for user {user_id}")
-        return "Xin lỗi, yêu cầu của anh/chị mất quá nhiều thời gian xử lý. Vui lòng thử lại."
-    except Exception as e:
-        logger.error(f"❌ Agent error for user {user_id}: {e}", exc_info=True) # gửi đầy đủ thông tin log 
-        return "Xin lỗi, đã xảy ra lỗi khi xử lý yêu cầu của anh/chị."
-
+        except Exception as e:
+            last_error = str(e)
+            logger.error(f"❌ Agent error on attempt {attempt + 1}/{max_retries}: {e}")
+            
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                logger.info(f"⏳ Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise
+    
+    # Nếu hết tất cả retries
+    raise Exception(f"Failed after {max_retries} attempts: {last_error}")
 # ==================== MESSAGE HANDLER ====================
 async def handle_message(
     redis: aioredis.Redis,
