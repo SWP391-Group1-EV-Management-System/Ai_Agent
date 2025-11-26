@@ -207,7 +207,7 @@ async def view_car_of_driver(user: str, jwt: str) -> str:
 
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
             response = await client.get(
-                f"{BACKEND_URL}/api/car/all/{user}",
+                f"{BACKEND_URL}/api/car/allForUser/{user}",
                 cookies={"jwt": jwt}
             )
 
